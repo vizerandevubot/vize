@@ -57,25 +57,37 @@ Bu, hatırlatıcı zamanı geldiğinde size **e-posta gönderilmesi** içindir (
 
 Bunlar, o hesaplara gelen yeni mailleri otomatik olarak Telegram'a düşürür. Her sağlayıcı için ayrı kurulum var, istediğinizi/istediklerinizi ekleyin, hiçbiri zorunlu değil.
 
-### Gmail
+**Herhangi bir sayıda hesap ekleyebilirsiniz** (Gmail, Yandex, Yahoo, iCloud, Zoho, GMX, Mail.ru, hatta özel/kurumsal bir mail sunucusu) — hepsi tek bir sistemle çalışır: `IMAP_ADDRESS_1`/`IMAP_APP_PASSWORD_1`, `IMAP_ADDRESS_2`/`IMAP_APP_PASSWORD_2`, `IMAP_ADDRESS_3`/`IMAP_APP_PASSWORD_3` şeklinde numarayı artırarak devam edin (20'ye kadar). Bot, adresin `@`'dan sonraki kısmına bakarak hangi sunucuyu kullanacağını **otomatik anlıyor** — Gmail için `imap.gmail.com` yazmanıza gerek yok, sadece adresi ve şifreyi giriyorsunuz. Bilmediği özel bir domain olursa (şirket maili gibi) `IMAP_HOST_5` gibi elle sunucu adresi de girebilirsiniz. Yeni bir hesap eklemek istediğinizde tek yapmanız gereken bir sonraki boş numarayla iki satır eklemek — kod değişikliği gerekmez.
 
-Gmail hesabınızda 2 adımlı doğrulama açık olmalı. [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords) üzerinden "Mail" için bir uygulama şifresi oluşturun. Render'a `GMAIL_ADDRESS` (kendi adresiniz) ve `GMAIL_APP_PASSWORD` (oluşan 16 haneli şifre) olarak ekleyin.
+Sadece **Outlook/Hotmail/Live** farklı çalışıyor (aşağıdaki ayrı bölüme bakın), çünkü Microsoft o adresler için basit şifreyi tamamen kapattı.
 
-### Yandex Mail
+**Mail eklerinin gönderilmesi**: Bir mailde resim (örn. Fransa vizesinde gelen OTP kodu resmi) veya PDF/Word gibi bir dosya varsa, bot bunu otomatik olarak indirip Telegram'a da gönderir — ayrıca bir ayar yapmanıza gerek yok. Çok büyük dosyalar (varsayılan 20 MB üzeri) gönderilmez, bunu `MAIL_ATTACHMENT_MAX_MB` ile değiştirebilirsiniz.
 
-Yandex Mail'de Ayarlar > Tüm Ayarlar > Posta İstemcileri kısmından "imap.yandex.com üzerinden IMAP ile" seçeneğini açın. Sonra [passport.yandex.com](https://passport.yandex.com) > Hesap Yönetimi > Şifreler ve Yetkilendirme > Uygulama Şifreleri'nden yeni bir uygulama şifresi oluşturun. Render'a `YANDEX_ADDRESS` ve `YANDEX_APP_PASSWORD` olarak ekleyin.
+### Gmail / Yandex / Yahoo / iCloud / Zoho / GMX / Mail.ru
+
+Her hesapta 2 adımlı doğrulamayı açıp bir "uygulama şifresi" (app password) oluşturmanız gerekiyor — yeri sağlayıcıya göre değişir:
+- **Gmail**: [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords)
+- **Yandex**: Ayarlar > Tüm Ayarlar > Posta İstemcileri'nden IMAP'i açın, sonra [passport.yandex.com](https://passport.yandex.com) > Hesap Yönetimi > Şifreler ve Yetkilendirme > Uygulama Şifreleri
+- **Yahoo**: [account.yahoo.com/security](https://login.yahoo.com/account/security) > "Generate app password"
+- **iCloud**: [appleid.apple.com](https://appleid.apple.com) > Sign-In and Security > App-Specific Passwords
+- **Zoho**: Zoho Mail Ayarlar > Security > App Passwords
+- **GMX / Mail.ru**: hesap güvenlik ayarlarında benzer bir "uygulama şifresi" seçeneği arayın
+
+Aldığınız her adres/şifre çiftini Render'a `IMAP_ADDRESS_N` / `IMAP_APP_PASSWORD_N` olarak, numarayı artırarak ekleyin.
 
 ### Outlook / Hotmail
 
-Önemli: Microsoft, kişisel Outlook/Hotmail hesapları için eski usul "uygulama şifresi ile IMAP" erişimini 2026'da tamamen kapattı. Bu yüzden Outlook için farklı bir yol (OAuth) gerekiyor — biraz daha uzun ama tek seferlik:
+Önemli: Microsoft, kişisel Outlook/Hotmail hesapları için eski usul "uygulama şifresi ile IMAP" erişimini 2026'da tamamen kapattı. Bu yüzden Outlook için farklı bir yol (OAuth) gerekiyor — biraz daha uzun ama tek seferlik. **Aynı Azure uygulamasını (aynı CLIENT_ID) tüm Outlook hesaplarınız için kullanabilirsiniz, sadece her hesap için ayrı bir REFRESH_TOKEN almanız gerekiyor.**
 
 1. [portal.azure.com](https://portal.azure.com) adresine kendi Microsoft hesabınızla girin (ücretsiz, kredi kartı istemez).
 2. "Microsoft Entra ID" > "App registrations" > "New registration". İsim verin (örn. "Is Ajandasi Botu"). "Supported account types" için **"Personal Microsoft accounts only"** seçin. Redirect URI'yi boş bırakabilirsiniz.
 3. Oluşan uygulamanın "Overview" sayfasından **Application (client) ID**'yi kopyalayın.
 4. Sol menüden "Authentication" > aşağı inip **"Allow public client flows"** seçeneğini **Yes** yapın, kaydedin.
-5. Kendi bilgisayarınızda: `pip install msal`, sonra bu klasördeki `get_outlook_refresh_token.py` dosyasını açıp içindeki `CLIENT_ID` değerini adım 3'teki ID ile değiştirin.
-6. `python get_outlook_refresh_token.py` çalıştırın. Ekranda bir internet adresi ve kod göreceksiniz (`microsoft.com/devicelogin`); tarayıcıda o adrese gidip kodu girin, Outlook hesabınızla giriş yapıp izin verin.
-7. Terminalde çıkan `OUTLOOK_CLIENT_ID` ve `OUTLOOK_REFRESH_TOKEN` değerlerini Render'a ekleyin.
+5. Sol menüden "API permissions" ile devam etmenize gerek yok; ama "OAuth consent screen" bir "Test users" listesi isterse (bazı kurulumlarda sormaz), izlemek istediğiniz **her** Outlook/Hotmail adresini o listeye ekleyin — eklemezseniz o hesapla giriş yaparken "erişim reddedildi" hatası alırsınız.
+6. Kendi bilgisayarınızda: `pip install msal`, sonra bu klasördeki `get_outlook_refresh_token.py` dosyasını açıp içindeki `CLIENT_ID` değerini adım 3'teki ID ile değiştirin.
+7. `python get_outlook_refresh_token.py` çalıştırın. Ekranda bir internet adresi ve kod göreceksiniz (`microsoft.com/devicelogin`); tarayıcıda o adrese gidip kodu girin, **1. Outlook hesabınızla** giriş yapıp izin verin.
+8. Terminalde çıkan `OUTLOOK_CLIENT_ID` ve `OUTLOOK_REFRESH_TOKEN` değerlerini Render'a `OUTLOOK_CLIENT_ID` ve `OUTLOOK_REFRESH_TOKEN_1` olarak ekleyin.
+9. **2. Outlook hesabınız için**: `python get_outlook_refresh_token.py`'i tekrar çalıştırın, bu sefer tarayıcıda **2. hesabınızla** giriş yapın. Çıkan yeni refresh token'ı Render'a `OUTLOOK_REFRESH_TOKEN_2` olarak ekleyin (`OUTLOOK_CLIENT_ID` aynı kalır, tekrar eklemenize gerek yok).
 
 ### Bildirimleri Vize ile Sınırlama (Opsiyonel)
 
