@@ -1,9 +1,11 @@
 import os
 import re
+import base64
 import imaplib
 import email as email_lib
 import logging
 import calendar as pycalendar
+from io import BytesIO
 from datetime import datetime, timedelta, date
 from queue import Queue
 from zoneinfo import ZoneInfo
@@ -61,15 +63,99 @@ TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
 TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER")
 TWILIO_TO_NUMBER = os.environ.get("TWILIO_TO_NUMBER")
 
-# --- Mail izleme ayarlari ---
-GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS")
-GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
+# --- Mail izleme ayarlari (birden fazla hesap, herhangi bir IMAP saglayicisi) ---
+# Bilinen saglayicilarin IMAP sunucusu, e-posta adresinin @'dan sonraki
+# kismina bakilarak otomatik bulunur - kullanicinin sunucu adresi girmesine
+# gerek kalmaz. Listede olmayan bir domain icin IMAP_HOST_N ile elle
+# belirtilebilir (ozel/kurumsal mail sunuculari icin).
+KNOWN_IMAP_HOSTS = {
+    "gmail.com": "imap.gmail.com",
+    "googlemail.com": "imap.gmail.com",
+    "yandex.com": "imap.yandex.com",
+    "yandex.ru": "imap.yandex.com",
+    "yandex.com.tr": "imap.yandex.com",
+    "yahoo.com": "imap.mail.yahoo.com",
+    "yahoo.co.uk": "imap.mail.yahoo.com",
+    "yahoo.com.tr": "imap.mail.yahoo.com",
+    "icloud.com": "imap.mail.me.com",
+    "me.com": "imap.mail.me.com",
+    "mac.com": "imap.mail.me.com",
+    "zoho.com": "imap.zoho.com",
+    "zoho.eu": "imap.zoho.eu",
+    "gmx.com": "imap.gmx.com",
+    "gmx.net": "imap.gmx.net",
+    "gmx.de": "imap.gmx.net",
+    "mail.ru": "imap.mail.ru",
+    "aol.com": "imap.aol.com",
+}
 
-YANDEX_ADDRESS = os.environ.get("YANDEX_ADDRESS")
-YANDEX_APP_PASSWORD = os.environ.get("YANDEX_APP_PASSWORD")
+# Bu saglayicilar artik basit sifre/uygulama sifresiyle IMAP kabul etmiyor,
+# OAuth gerekiyor - bunlar icin Outlook bolumundeki yontem kullanilmali.
+OAUTH_ONLY_DOMAINS = {"outlook.com", "hotmail.com", "live.com", "msn.com"}
+
+
+def guess_imap_host(address, explicit_host=None):
+    if explicit_host:
+        return explicit_host
+    domain = address.split("@")[-1].lower().strip()
+    if domain in OAUTH_ONLY_DOMAINS:
+        return None
+    return KNOWN_IMAP_HOSTS.get(domain)
+
+
+def load_imap_accounts(max_accounts=20):
+    """
+    IMAP_ADDRESS_1 / IMAP_APP_PASSWORD_1, IMAP_ADDRESS_2 / IMAP_APP_PASSWORD_2 ...
+    seklinde numaralanmis, herhangi bir mail saglayicisina ait hesaplari okur.
+    Gerekirse IMAP_HOST_N ile sunucu adresi elle verilebilir (bilinmeyen/ozel
+    domainler icin), IMAP_LABEL_N ile bildirimde gorunecek isim degistirilebilir.
+    """
+    accounts = []
+    for i in range(1, max_accounts + 1):
+        addr = os.environ.get(f"IMAP_ADDRESS_{i}")
+        pwd = os.environ.get(f"IMAP_APP_PASSWORD_{i}")
+        if not (addr and pwd):
+            continue
+        explicit_host = os.environ.get(f"IMAP_HOST_{i}")
+        host = guess_imap_host(addr, explicit_host)
+        if not host:
+            logger.error(
+                "IMAP_ADDRESS_%s (%s) icin sunucu belirlenemedi - "
+                "IMAP_HOST_%s ekleyin ya da bu adres Outlook/Hotmail ise "
+                "OAuth yontemini kullanin.", i, addr, i,
+            )
+            continue
+        label = os.environ.get(f"IMAP_LABEL_{i}") or addr
+        accounts.append({"key": f"imap_{i}", "host": host, "address": addr, "password": pwd, "label": label})
+    return accounts
+
+
+IMAP_ACCOUNTS = load_imap_accounts()
+
+# Mail eklerinin (resim/pdf/word vb.) Telegram'a gonderilecek azami boyutu.
+MAIL_ATTACHMENT_MAX_MB = float(os.environ.get("MAIL_ATTACHMENT_MAX_MB", "20"))
+MAIL_ATTACHMENT_MAX_BYTES = int(MAIL_ATTACHMENT_MAX_MB * 1024 * 1024)
+
+
+def load_outlook_refresh_tokens(max_accounts=10):
+    """
+    OUTLOOK_REFRESH_TOKEN_1, OUTLOOK_REFRESH_TOKEN_2 ... seklinde numaralanmis
+    (her biri ayri bir Microsoft hesabi icin) refresh token'lari okur.
+    Numarasiz OUTLOOK_REFRESH_TOKEN da (tek hesap icin) desteklenir.
+    """
+    tokens = []
+    single = os.environ.get("OUTLOOK_REFRESH_TOKEN")
+    if single:
+        tokens.append(single)
+    for i in range(1, max_accounts + 1):
+        val = os.environ.get(f"OUTLOOK_REFRESH_TOKEN_{i}")
+        if val:
+            tokens.append(val)
+    return tokens
+
 
 OUTLOOK_CLIENT_ID = os.environ.get("OUTLOOK_CLIENT_ID")
-OUTLOOK_REFRESH_TOKEN_ENV = os.environ.get("OUTLOOK_REFRESH_TOKEN")
+OUTLOOK_REFRESH_TOKENS_ENV = load_outlook_refresh_tokens()
 
 # Bos birakilirsa TUM gelen mailler Telegram'a duser. Doldurulursa (virgulle
 # ayrilmis kelimeler) sadece konu/gonderen/govdede bu kelimelerden birini
@@ -633,7 +719,49 @@ def mail_matches_filter(sender, subject, body):
     return any(k in haystack for k in EMAIL_KEYWORDS)
 
 
-def notify_new_mail(provider, sender, subject, body):
+def extract_attachments(msg):
+    """
+    Bir e-postadaki tum dosyalari (ek olarak eklenmis veya govde icine
+    gomulmus resimler dahil - ornegin OTP kodu resmi) cikarir. Dosya adi
+    olan her parcayi bir ek olarak kabul eder.
+    """
+    attachments = []
+    if not msg.is_multipart():
+        return attachments
+    for part in msg.walk():
+        ctype = part.get_content_type()
+        if ctype in ("multipart/mixed", "multipart/alternative", "multipart/related"):
+            continue
+        filename = part.get_filename()
+        if not filename:
+            continue
+        try:
+            data = part.get_payload(decode=True)
+        except Exception:
+            data = None
+        if not data:
+            continue
+        attachments.append({
+            "filename": decode_mime_words(filename),
+            "data": data,
+            "content_type": ctype,
+        })
+    return attachments
+
+
+def send_telegram_file(chat_id, filename, data, content_type):
+    bio = BytesIO(data)
+    bio.name = filename or "dosya"
+    try:
+        if content_type and content_type.startswith("image/"):
+            bot.send_photo(chat_id=chat_id, photo=bio, caption=filename)
+        else:
+            bot.send_document(chat_id=chat_id, document=bio, filename=filename)
+    except Exception as e:
+        logger.error("Dosya gonderilemedi (%s): %s", filename, e)
+
+
+def notify_new_mail(provider, sender, subject, body, attachments=None):
     if not mail_matches_filter(sender, subject, body):
         return
     chat_id = get_primary_chat_id()
@@ -644,6 +772,18 @@ def notify_new_mail(provider, sender, subject, body):
         bot.send_message(chat_id=chat_id, text=text)
     except Exception as e:
         logger.error("Mail bildirimi gonderilemedi: %s", e)
+
+    for att in (attachments or []):
+        if len(att["data"]) > MAIL_ATTACHMENT_MAX_BYTES:
+            try:
+                bot.send_message(
+                    chat_id=chat_id,
+                    text=f"(Ek dosya '{att['filename']}' {MAIL_ATTACHMENT_MAX_MB:.0f} MB sinirindan buyuk oldugu icin gonderilemedi)",
+                )
+            except Exception:
+                pass
+            continue
+        send_telegram_file(chat_id, att["filename"], att["data"], att["content_type"])
 
 
 def get_last_uid(account_key):
@@ -685,7 +825,8 @@ def poll_imap_account(account_key, host, user, password, label):
                 subject = decode_mime_words(msg.get("Subject", ""))
                 sender = decode_mime_words(msg.get("From", ""))
                 body = get_email_body_snippet(msg)
-                notify_new_mail(label, sender, subject, body)
+                attachments = extract_attachments(msg)
+                notify_new_mail(label, sender, subject, body, attachments)
                 if not max_uid or uid_int > max_uid:
                     max_uid = uid_int
             if max_uid:
@@ -699,15 +840,15 @@ def poll_imap_account(account_key, host, user, password, label):
         logger.error("%s IMAP hatasi: %s", label, e)
 
 
-def get_outlook_refresh_token_value():
-    doc = mail_state.find_one({"_id": "outlook_token"})
+def get_outlook_refresh_token_value(idx, env_value):
+    doc = mail_state.find_one({"_id": f"outlook_token_{idx}"})
     if doc and doc.get("refresh_token"):
         return doc["refresh_token"]
-    return OUTLOOK_REFRESH_TOKEN_ENV
+    return env_value
 
 
-def get_outlook_access_token():
-    refresh_token = get_outlook_refresh_token_value()
+def get_outlook_access_token(idx, env_value):
+    refresh_token = get_outlook_refresh_token_value(idx, env_value)
     if not (OUTLOOK_CLIENT_ID and refresh_token):
         return None
     try:
@@ -723,27 +864,54 @@ def get_outlook_access_token():
         )
         data = r.json()
         if "access_token" not in data:
-            logger.error("Outlook token yenilenemedi: %s", data)
+            logger.error("Outlook #%s token yenilenemedi: %s", idx, data)
             return None
         new_refresh = data.get("refresh_token")
         if new_refresh:
             mail_state.update_one(
-                {"_id": "outlook_token"}, {"$set": {"refresh_token": new_refresh}}, upsert=True
+                {"_id": f"outlook_token_{idx}"}, {"$set": {"refresh_token": new_refresh}}, upsert=True
             )
         return data["access_token"]
     except Exception as e:
-        logger.error("Outlook token istegi basarisiz: %s", e)
+        logger.error("Outlook #%s token istegi basarisiz: %s", idx, e)
         return None
 
 
-def poll_outlook():
-    if not OUTLOOK_CLIENT_ID or not get_outlook_refresh_token_value():
-        return
-    token = get_outlook_access_token()
+def fetch_outlook_attachments(token, message_id):
+    attachments = []
+    try:
+        r = requests.get(
+            f"https://graph.microsoft.com/v1.0/me/messages/{message_id}/attachments",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=20,
+        )
+        if r.status_code != 200:
+            logger.error("Outlook ek dosyalari alinamadi: %s %s", r.status_code, r.text)
+            return attachments
+        for item in r.json().get("value", []):
+            content_bytes = item.get("contentBytes")
+            if not content_bytes:
+                continue
+            try:
+                data = base64.b64decode(content_bytes)
+            except Exception:
+                continue
+            attachments.append({
+                "filename": item.get("name") or "dosya",
+                "data": data,
+                "content_type": item.get("contentType") or "application/octet-stream",
+            })
+    except Exception as e:
+        logger.error("Outlook ek dosyalari istegi basarisiz: %s", e)
+    return attachments
+
+
+def poll_outlook_account(idx, env_value):
+    token = get_outlook_access_token(idx, env_value)
     if not token:
         return
 
-    doc = mail_state.find_one({"_id": "outlook"})
+    doc = mail_state.find_one({"_id": f"outlook_{idx}"})
     last_check = None
     if doc and doc.get("last_check"):
         last_check = doc["last_check"].replace(tzinfo=UTC)
@@ -755,16 +923,16 @@ def poll_outlook():
             params={
                 "$orderby": "receivedDateTime desc",
                 "$top": "15",
-                "$select": "subject,from,receivedDateTime,bodyPreview",
+                "$select": "id,subject,from,receivedDateTime,bodyPreview,hasAttachments",
             },
             timeout=15,
         )
         if r.status_code != 200:
-            logger.error("Graph API hatasi: %s %s", r.status_code, r.text)
+            logger.error("Graph API hatasi (Outlook #%s): %s %s", idx, r.status_code, r.text)
             return
         messages = r.json().get("value", [])
     except Exception as e:
-        logger.error("Outlook mesajlari alinamadi: %s", e)
+        logger.error("Outlook #%s mesajlari alinamadi: %s", idx, e)
         return
 
     newest_seen = last_check
@@ -780,20 +948,22 @@ def poll_outlook():
             sender = m.get("from", {}).get("emailAddress", {}).get("address", "")
         except Exception:
             pass
-        notify_new_mail("Outlook", sender, m.get("subject", ""), m.get("bodyPreview", ""))
+        attachments = fetch_outlook_attachments(token, m["id"]) if m.get("hasAttachments") else []
+        notify_new_mail(f"Outlook #{idx}", sender, m.get("subject", ""), m.get("bodyPreview", ""), attachments)
         if not newest_seen or received > newest_seen:
             newest_seen = received
 
     if newest_seen:
         mail_state.update_one(
-            {"_id": "outlook"}, {"$set": {"last_check": newest_seen}}, upsert=True
+            {"_id": f"outlook_{idx}"}, {"$set": {"last_check": newest_seen}}, upsert=True
         )
 
 
 def check_new_mail():
-    poll_imap_account("gmail", "imap.gmail.com", GMAIL_ADDRESS, GMAIL_APP_PASSWORD, "Gmail")
-    poll_imap_account("yandex", "imap.yandex.com", YANDEX_ADDRESS, YANDEX_APP_PASSWORD, "Yandex")
-    poll_outlook()
+    for acc in IMAP_ACCOUNTS:
+        poll_imap_account(acc["key"], acc["host"], acc["address"], acc["password"], acc["label"])
+    for idx, token_env in enumerate(OUTLOOK_REFRESH_TOKENS_ENV, start=1):
+        poll_outlook_account(idx, token_env)
 
 
 scheduler = BackgroundScheduler(timezone="UTC")
