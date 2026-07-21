@@ -103,7 +103,7 @@ def guess_imap_host(address, explicit_host=None):
     return KNOWN_IMAP_HOSTS.get(domain)
 
 
-def load_imap_accounts(max_accounts=20):
+def load_imap_accounts(max_accounts=30):
     """
     IMAP_ADDRESS_1 / IMAP_APP_PASSWORD_1, IMAP_ADDRESS_2 / IMAP_APP_PASSWORD_2 ...
     seklinde numaralanmis, herhangi bir mail saglayicisina ait hesaplari okur.
@@ -137,7 +137,7 @@ MAIL_ATTACHMENT_MAX_MB = float(os.environ.get("MAIL_ATTACHMENT_MAX_MB", "20"))
 MAIL_ATTACHMENT_MAX_BYTES = int(MAIL_ATTACHMENT_MAX_MB * 1024 * 1024)
 
 
-def load_outlook_refresh_tokens(max_accounts=10):
+def load_outlook_refresh_tokens(max_accounts=30):
     """
     OUTLOOK_REFRESH_TOKEN_1, OUTLOOK_REFRESH_TOKEN_2 ... seklinde numaralanmis
     (her biri ayri bir Microsoft hesabi icin) refresh token'lari okur.
