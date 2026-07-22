@@ -450,6 +450,7 @@ def build_main_menu_keyboard():
 PASSPORT_MANUAL_FIELDS = [
     ("vize_turu", "Vize Turu nedir? (orn. Hollanda-Ankara-Aile Ziyareti)"),
     ("islemi_yapan", "Islemi yapan kimin adina? (orn. ISMAIL)"),
+    ("yonlendiren_kisi", "Yonlendiren kisi kim? (referans/yonlendiren yoksa '-' yazin)"),
     ("mail", "Basvuru icin kullanilacak mail adresi nedir?"),
     ("sifre", "Bu mail hesabinin sifresi nedir?"),
     ("tel", "Telefon numarasi nedir?"),
@@ -473,7 +474,7 @@ FIELD_LABELS = {
     "isim": "Isim", "soyisim": "Soyisim", "pasaport_no": "Pasaport No",
     "dogum_tarihi": "Dogum Tarihi", "pasaport_skt": "Pasaport SKT", "uyruk": "Uyruk",
     "kimlik_no": "Kimlik No", "vize_turu": "Vize Turu", "islemi_yapan": "Islemi Yapan",
-    "mail": "Mail", "sifre": "Sifre", "tel": "Tel",
+    "yonlendiren_kisi": "Yonlendiren Kisi", "mail": "Mail", "sifre": "Sifre", "tel": "Tel",
 }
 
 
@@ -1558,6 +1559,7 @@ FIELD_SYNONYMS = {
     "kimlik_no": ["kimlik no"],
     "vize_turu": ["vize turu"],
     "islemi_yapan": ["islemi yapan", "islem yapan"],
+    "yonlendiren_kisi": ["yonlendiren kisi", "yonlendiren", "yonlendirici"],
     "mail": ["mail", "mail adresi", "e posta"],
     "sifre": ["sifre", "parola"],
     "tel": ["tel", "telefon"],
