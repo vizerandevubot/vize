@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import html as html_lib
 import base64
 import mimetypes
@@ -36,10 +37,17 @@ import requests
 try:
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request as GoogleRequest
+    from google.oauth2.service_account import Credentials as ServiceAccountCredentials
     from googleapiclient.discovery import build
     GOOGLE_LIBS_AVAILABLE = True
 except ImportError:
     GOOGLE_LIBS_AVAILABLE = False
+
+try:
+    from mrz.checker.td3 import TD3CodeChecker
+    MRZ_LIB_AVAILABLE = True
+except ImportError:
+    MRZ_LIB_AVAILABLE = False
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -54,6 +62,13 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "degistir-bu-gizli-yolu")
 MONGO_URI = os.environ["MONGO_URI"]
 
+# Ekip erisimi: bu kod bos birakilirsa botu Telegram'da acan HERKES otomatik
+# yetkilenir (tek kisilik kullanim icin varsayilan). Birden fazla kisinin
+# (siz + ekip arkadaslariniz) ayni botu, ayni paylasili hatirlatici/pasaport
+# verisini gorerek kullanmasini istiyorsaniz bir deger girin - yeni katilan
+# herkes Telegram'da "Start"a bastiktan sonra bu kodu yazarak eklenir.
+TEAM_ACCESS_CODE = os.environ.get("TEAM_ACCESS_CODE", "").strip()
+
 EMAILJS_SERVICE_ID = os.environ.get("EMAILJS_SERVICE_ID")
 EMAILJS_TEMPLATE_ID = os.environ.get("EMAILJS_TEMPLATE_ID")
 EMAILJS_PUBLIC_KEY = os.environ.get("EMAILJS_PUBLIC_KEY")
@@ -64,6 +79,13 @@ GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
 GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN")
 GOOGLE_CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "primary")
+
+# --- Pasaport -> Google Sheets entegrasyonu (opsiyonel) ---
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+SHEETS_SPREADSHEET_ID = os.environ.get("SHEETS_SPREADSHEET_ID")
+OCR_SPACE_API_KEY = os.environ.get("OCR_SPACE_API_KEY")
+MASTER_SHEET_NAME = os.environ.get("MASTER_SHEET_NAME", "RANDEVU ALINMIŞLAR")
+ACCOUNTS_SHEET_NAME = os.environ.get("ACCOUNTS_SHEET_NAME", "hesap tanımla")
 
 # SMS opsiyoneldir, kalici ucretsiz bir servis yoktur.
 TWILIO_SID = os.environ.get("TWILIO_SID")
@@ -174,7 +196,7 @@ EMAIL_KEYWORDS = [
     for k in os.environ.get("EMAIL_KEYWORDS", "").split(",")
     if k.strip()
 ]
-MAIL_CHECK_INTERVAL_SECONDS = int(os.environ.get("MAIL_CHECK_INTERVAL_SECONDS", "120"))
+MAIL_CHECK_INTERVAL_SECONDS = int(os.environ.get("MAIL_CHECK_INTERVAL_SECONDS", "15"))
 
 # ---------------------------------------------------------------------------
 # Kurulum
@@ -189,6 +211,7 @@ reminders = db["reminders"]
 config = db["config"]
 mail_state = db["mail_state"]
 counters = db["counters"]
+team = db["team"]
 
 # Buton akisi sirasinda kullanicinin nerede oldugunu tutan bellek ici durum.
 # (Render tek worker ile calistigi surece sorunsuzdur; servis yeniden
@@ -219,14 +242,44 @@ def set_primary_chat_id(chat_id):
 
 
 def next_seq_id(chat_id):
-    """Her kullanici icin 1'den baslayan, kolay yazilabilir bir hatirlatici ID'si uretir."""
+    """
+    Hatirlatici ID'si artik EKIP genelinde tek bir sayaçtan uretiliyor (chat
+    basina degil) - boylece birden fazla kisi ayni botu kullansa da ID'ler
+    çakismaz, herkes ayni numarayla ayni kaydi konusabilir.
+    """
     doc = counters.find_one_and_update(
-        {"_id": f"chat_{chat_id}"},
+        {"_id": "reminder_seq"},
         {"$inc": {"seq": 1}},
         upsert=True,
         return_document=ReturnDocument.AFTER,
     )
     return doc["seq"]
+
+
+# --- Ekip erisimi (birden fazla kisi ayni paylasili veriyi gorsun/yonetsin) ---
+def is_authorized(chat_id):
+    if not TEAM_ACCESS_CODE:
+        return True
+    return team.find_one({"_id": chat_id}) is not None
+
+
+def authorize_chat(chat_id):
+    team.update_one({"_id": chat_id}, {"$set": {"joined_at": datetime.now(UTC)}}, upsert=True)
+
+
+def get_authorized_chat_ids():
+    if not TEAM_ACCESS_CODE:
+        primary = get_primary_chat_id()
+        return [primary] if primary else []
+    return [doc["_id"] for doc in team.find({})]
+
+
+def broadcast_message(text, **kwargs):
+    for cid in get_authorized_chat_ids():
+        try:
+            bot.send_message(chat_id=cid, text=text, **kwargs)
+        except Exception as e:
+            logger.error("Mesaj gonderilemedi (chat_id=%s): %s", cid, e)
 
 
 def offset_label(minutes):
@@ -388,12 +441,59 @@ def build_main_menu_keyboard():
         [InlineKeyboardButton("➕ Hatirlatici Ekle", callback_data="add")],
         [InlineKeyboardButton("\U0001f4cb Tum Hatirlaticilari Gor", callback_data="list")],
         [InlineKeyboardButton("\U0001f5d1 Hatirlatici Sil", callback_data="delprompt")],
+        [InlineKeyboardButton("\U0001f6c2 Pasaport Ekle", callback_data="passport_add")],
+        [InlineKeyboardButton("✅ Randevu Aldim", callback_data="appt_start")],
     ]
     return InlineKeyboardMarkup(rows)
 
 
+PASSPORT_MANUAL_FIELDS = [
+    ("vize_turu", "Vize Turu nedir? (orn. Hollanda-Ankara-Aile Ziyareti)"),
+    ("islemi_yapan", "Islemi yapan kimin adina? (orn. ISMAIL)"),
+    ("mail", "Basvuru icin kullanilacak mail adresi nedir?"),
+    ("sifre", "Bu mail hesabinin sifresi nedir?"),
+    ("tel", "Telefon numarasi nedir?"),
+]
+
+# OCR/MRZ basarisiz olursa veya kullanici "Elle Gir" secerse, kimlik
+# alanlari da tek tek soru olarak sorulur.
+IDENTITY_FIELD_PROMPTS = [
+    ("isim", "Isim nedir?"),
+    ("soyisim", "Soyisim nedir?"),
+    ("pasaport_no", "Pasaport No nedir?"),
+    ("dogum_tarihi", "Dogum Tarihi nedir? (GG.AA.YYYY, orn. 05.03.1990)"),
+    ("pasaport_skt", "Pasaport Son Kullanma Tarihi nedir? (GG.AA.YYYY)"),
+    ("uyruk", "Uyruk nedir?"),
+    ("kimlik_no", "Kimlik No nedir?"),
+]
+
+DATE_PATTERN = re.compile(r"^\s*(0[1-9]|[12]\d|3[01])\.(0[1-9]|1[0-2])\.(20\d{2})\s*$")
+
+FIELD_LABELS = {
+    "isim": "Isim", "soyisim": "Soyisim", "pasaport_no": "Pasaport No",
+    "dogum_tarihi": "Dogum Tarihi", "pasaport_skt": "Pasaport SKT", "uyruk": "Uyruk",
+    "kimlik_no": "Kimlik No", "vize_turu": "Vize Turu", "islemi_yapan": "Islemi Yapan",
+    "mail": "Mail", "sifre": "Sifre", "tel": "Tel",
+}
+
+
+def build_country_keyboard(service, callback_prefix):
+    """
+    Google Sheets'teki ulke sayfalarini CANLI okuyup buton listesi olusturur.
+    Sayfa isimlerini PENDING["country_list"] icine kaydedip index kullanarak
+    referans veriyoruz - boylece Turkce karakter/bosluk/'|' iceren sayfa
+    isimleri callback_data'da sorun cikarmaz.
+    """
+    names = list_country_sheets(service)
+    rows = [[InlineKeyboardButton(name, callback_data=f"{callback_prefix}|{i}")] for i, name in enumerate(names)]
+    rows.append([InlineKeyboardButton("\U0001f3e0 Ana Menu", callback_data="menu")])
+    return InlineKeyboardMarkup(rows), names
+
+
 def build_reminder_list_text(chat_id):
-    items = list(reminders.find({"chat_id": chat_id}).sort("remind_at", 1).limit(50))
+    # Hatirlaticilar artik ekip genelinde paylasili: kim ekledi olursa olsun
+    # tum yetkili sohbetler ayni listeyi gorur.
+    items = list(reminders.find({}).sort("remind_at", 1).limit(50))
     if not items:
         return "Henuz hatirlatici eklemediniz."
     lines = ["Tum hatirlaticilariniz:\n"]
@@ -414,6 +514,15 @@ def build_reminder_list_text(chat_id):
 # ---------------------------------------------------------------------------
 def start(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
+
+    if not is_authorized(chat_id):
+        PENDING[chat_id] = {"awaiting_access_code": True}
+        update.message.reply_text(
+            "Bu, paylasilan bir is ajandasi botu. Devam etmek icin size verilen "
+            "erisim kodunu yazip gonderin."
+        )
+        return
+
     set_primary_chat_id(chat_id)
     update.message.reply_text(
         "Merhaba! Ben is ajandanizim. Hatirlaticilarinizi ve gelen onemli "
@@ -449,6 +558,10 @@ def button_router(update: Update, context: CallbackContext):
     query = update.callback_query
     chat_id = query.message.chat_id
     data = query.data
+
+    if not is_authorized(chat_id):
+        query.answer("Bu botu kullanmak icin once erisim kodunu girin.", show_alert=True)
+        return
 
     if data == "noop":
         query.answer()
@@ -546,6 +659,127 @@ def button_router(update: Update, context: CallbackContext):
         )
         return
 
+    # --- Pasaport ekleme akisi ---
+    if data == "passport_add":
+        query.answer()
+        service = get_sheets_service()
+        if not service:
+            replace_ui(
+                query,
+                "Google Sheets baglantisi kurulu degil. Lutfen once GOOGLE_SERVICE_ACCOUNT_JSON "
+                "ve SHEETS_SPREADSHEET_ID ayarlarini tamamlayin.",
+                build_main_menu_keyboard(),
+            )
+            return
+        keyboard, names = build_country_keyboard(service, "country_select")
+        if not names:
+            replace_ui(query, "Tabloda hicbir ulke sayfasi bulunamadi.", build_main_menu_keyboard())
+            return
+        PENDING[chat_id] = {"country_list": names}
+        replace_ui(query, "Hangi ulke icin pasaport eklenecek?", keyboard)
+        return
+
+    if data.startswith("country_select|"):
+        _, idx = data.split("|")
+        pending = PENDING.get(chat_id, {})
+        names = pending.get("country_list", [])
+        try:
+            country = names[int(idx)]
+        except Exception:
+            query.answer("Gecersiz secim, tekrar deneyin.", show_alert=True)
+            return
+        query.answer()
+        PENDING[chat_id] = {"country_sheet": country, "awaiting_passport_photo": True}
+        replace_ui(
+            query,
+            f"'{country}' sayfasina eklenecek. Simdi pasaportun fotografini gonderin "
+            "(net cekilmis, MRZ satirlarinin - alttaki iki satirin - gorunur oldugu bir foto).",
+        )
+        return
+
+    if data == "passport_manual_start":
+        pending = PENDING.get(chat_id, {})
+        country = pending.get("country_sheet")
+        if not country:
+            query.answer("Once bir ulke secmelisiniz.", show_alert=True)
+            return
+        query.answer()
+        queue = list(IDENTITY_FIELD_PROMPTS) + list(PASSPORT_MANUAL_FIELDS)
+        PENDING[chat_id] = {
+            "country_sheet": country,
+            "passport_fields": {},
+            "manual_queue": queue,
+            "manual_index": 0,
+            "awaiting_passport_manual": True,
+        }
+        replace_ui(query, queue[0][1])
+        return
+
+    if data == "passport_confirm_yes":
+        pending = PENDING.get(chat_id, {})
+        country = pending.get("country_sheet")
+        mrz_fields = pending.get("mrz_fields")
+        if not country or not mrz_fields:
+            query.answer("Bir sorun olustu, bastan baslayin.", show_alert=True)
+            replace_ui(query, "Ana Menu:", build_main_menu_keyboard())
+            return
+        query.answer()
+        queue = list(PASSPORT_MANUAL_FIELDS)
+        PENDING[chat_id] = {
+            "country_sheet": country,
+            "passport_fields": dict(mrz_fields),
+            "manual_queue": queue,
+            "manual_index": 0,
+            "awaiting_passport_manual": True,
+        }
+        replace_ui(query, queue[0][1])
+        return
+
+    if data == "passport_confirm_no":
+        pending = PENDING.get(chat_id, {})
+        country = pending.get("country_sheet")
+        query.answer()
+        PENDING[chat_id] = {"country_sheet": country, "awaiting_passport_photo": True}
+        replace_ui(query, "Tamam, pasaportun fotografini tekrar gonderin.")
+        return
+
+    # --- Randevu Aldim akisi ---
+    if data == "appt_start":
+        query.answer()
+        service = get_sheets_service()
+        if not service:
+            replace_ui(
+                query,
+                "Google Sheets baglantisi kurulu degil. Lutfen once GOOGLE_SERVICE_ACCOUNT_JSON "
+                "ve SHEETS_SPREADSHEET_ID ayarlarini tamamlayin.",
+                build_main_menu_keyboard(),
+            )
+            return
+        keyboard, names = build_country_keyboard(service, "appt_country")
+        if not names:
+            replace_ui(query, "Tabloda hicbir ulke sayfasi bulunamadi.", build_main_menu_keyboard())
+            return
+        PENDING[chat_id] = {"country_list": names}
+        replace_ui(query, "Hangi ulke sayfasindaki kayit icin randevu alindi?", keyboard)
+        return
+
+    if data.startswith("appt_country|"):
+        _, idx = data.split("|")
+        pending = PENDING.get(chat_id, {})
+        names = pending.get("country_list", [])
+        try:
+            country = names[int(idx)]
+        except Exception:
+            query.answer("Gecersiz secim, tekrar deneyin.", show_alert=True)
+            return
+        query.answer()
+        PENDING[chat_id] = {"country_sheet": country, "awaiting_appt_id": True}
+        replace_ui(
+            query,
+            f"'{country}' sayfasindaki kaydin ID numarasini yazip gonderin (sadece sayi, orn. 5).",
+        )
+        return
+
     query.answer()
 
 
@@ -556,6 +790,26 @@ def handle_text_input(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
     pending = PENDING.get(chat_id)
     raw_text = update.message.text.strip()
+
+    if pending and pending.get("awaiting_access_code"):
+        if TEAM_ACCESS_CODE and raw_text == TEAM_ACCESS_CODE:
+            authorize_chat(chat_id)
+            PENDING.pop(chat_id, None)
+            update.message.reply_text(
+                "Katildiniz! Artik hatirlaticilari, pasaport kayitlarini ve mail "
+                "bildirimlerini gorebilir, ekleyip duzenleyebilirsiniz.",
+                reply_markup=PERSISTENT_KEYBOARD,
+            )
+            update.message.reply_text("Ana Menu:", reply_markup=build_main_menu_keyboard())
+        else:
+            update.message.reply_text("Kod yanlis, tekrar deneyin.")
+        return
+
+    if not is_authorized(chat_id):
+        update.message.reply_text(
+            "Bu botu kullanmak icin once Telegram'in 'Start' dugmesine basip erisim kodunu girin."
+        )
+        return
 
     if raw_text == MENU_BUTTON_TEXT:
         PENDING.pop(chat_id, None)
@@ -586,7 +840,8 @@ def handle_text_input(update: Update, context: CallbackContext):
         except ValueError:
             update.message.reply_text("Lutfen sadece ID numarasini yazin (orn. 3).")
             return
-        result = reminders.delete_one({"chat_id": chat_id, "seq_id": seq_id})
+        # Ekip genelinde paylasili: kim ekledi olursa olsun ID ile silinebilir.
+        result = reminders.delete_one({"seq_id": seq_id})
         PENDING.pop(chat_id, None)
         if result.deleted_count:
             update.message.reply_text(f"#{seq_id} silindi.", reply_markup=build_main_menu_keyboard())
@@ -594,6 +849,145 @@ def handle_text_input(update: Update, context: CallbackContext):
             update.message.reply_text(
                 f"#{seq_id} ID'li bir hatirlatici bulunamadi.", reply_markup=build_main_menu_keyboard()
             )
+        return
+
+    if pending and pending.get("awaiting_passport_manual"):
+        key, _prompt = pending["manual_queue"][pending["manual_index"]]
+        value = raw_text
+        if key in ("dogum_tarihi", "pasaport_skt") and not DATE_PATTERN.match(value):
+            update.message.reply_text("Format hatali. GG.AA.YYYY seklinde yazin, orn. 05.03.1990")
+            return
+        pending["passport_fields"][key] = value
+        pending["manual_index"] += 1
+        if pending["manual_index"] < len(pending["manual_queue"]):
+            _next_key, next_prompt = pending["manual_queue"][pending["manual_index"]]
+            update.message.reply_text(next_prompt)
+            return
+        service = get_sheets_service()
+        country = pending["country_sheet"]
+        if not service:
+            update.message.reply_text("Google Sheets baglantisi kurulu degil.", reply_markup=build_main_menu_keyboard())
+            PENDING.pop(chat_id, None)
+            return
+        result = write_passport_row(service, country, pending["passport_fields"])
+        PENDING.pop(chat_id, None)
+        if result:
+            next_id, _ = result
+            update.message.reply_text(
+                f"Kayit '{country}' sayfasina eklendi (ID: {next_id}, bekleme listesi - sari).",
+                reply_markup=build_main_menu_keyboard(),
+            )
+        else:
+            update.message.reply_text(
+                "Kayit eklenemedi, sayfa basliklari okunamadi.", reply_markup=build_main_menu_keyboard()
+            )
+        return
+
+    if pending and pending.get("awaiting_appt_id"):
+        raw = raw_text.lstrip("#")
+        try:
+            target_id = int(raw)
+        except ValueError:
+            update.message.reply_text("Lutfen sadece ID numarasini yazin (orn. 5).")
+            return
+        service = get_sheets_service()
+        country = pending["country_sheet"]
+        if not service:
+            update.message.reply_text("Google Sheets baglantisi kurulu degil.", reply_markup=build_main_menu_keyboard())
+            PENDING.pop(chat_id, None)
+            return
+        row_index, headers, row_values = find_row_by_id(service, country, target_id)
+        if row_index is None:
+            update.message.reply_text(
+                f"'{country}' sayfasinda ID {target_id} bulunamadi.", reply_markup=build_main_menu_keyboard()
+            )
+            PENDING.pop(chat_id, None)
+            return
+        pending.update({
+            "row_index": row_index, "headers": headers, "row_values": row_values,
+            "awaiting_appt_id": False, "awaiting_appt_referans": True,
+        })
+        update.message.reply_text("Referans numarasini yazin (yoksa '-' yazabilirsiniz).")
+        return
+
+    if pending and pending.get("awaiting_appt_referans"):
+        pending["referans"] = raw_text
+        pending["awaiting_appt_referans"] = False
+        pending["awaiting_appt_date"] = True
+        update.message.reply_text("Randevu gunu nedir? (GG.AA.YYYY, orn. 14.09.2026)")
+        return
+
+    if pending and pending.get("awaiting_appt_date"):
+        if not DATE_PATTERN.match(raw_text):
+            update.message.reply_text("Format hatali. GG.AA.YYYY seklinde yazin, orn. 14.09.2026")
+            return
+        pending["randevu_gunu"] = raw_text
+        pending["awaiting_appt_date"] = False
+        pending["awaiting_appt_time"] = True
+        update.message.reply_text("Randevu saati nedir? (SS:DD, orn. 09:30)")
+        return
+
+    if pending and pending.get("awaiting_appt_time"):
+        m = TIME_PATTERN.match(raw_text)
+        if not m:
+            update.message.reply_text("Format hatali. Saat:Dakika seklinde yazin, orn. 09:30")
+            return
+        saat = f"{int(m.group(1)):02d}:{m.group(2)}"
+        service = get_sheets_service()
+        country = pending["country_sheet"]
+        if not service:
+            update.message.reply_text("Google Sheets baglantisi kurulu degil.", reply_markup=build_main_menu_keyboard())
+            PENDING.pop(chat_id, None)
+            return
+        row_index, headers = pending["row_index"], pending["headers"]
+        extra_fields = {
+            "referans": pending.get("referans", ""),
+            "randevu_gunu": pending.get("randevu_gunu", ""),
+            "saat": saat,
+            "islem_sonucu": "Randevu Alindi",
+        }
+        updated_row = apply_extra_fields_to_row(
+            service, country, row_index, headers, pending["row_values"], extra_fields
+        )
+        set_row_color(service, country, row_index, "red")
+        copy_to_master(service, headers, updated_row, extra_fields)
+
+        # Tablodaki randevu gunu/saatini hatirlatici sistemiyle birlestir: bu
+        # akistan gecen her randevu icin otomatik bir Telegram/takvim
+        # hatirlaticisi da olusturulur - ayrica elle hatirlatici eklemeye
+        # gerek kalmaz.
+        reminder_note = ""
+        try:
+            gun, ay, yil = pending["randevu_gunu"].split(".")
+            dt_local = datetime(int(yil), int(ay), int(gun), int(m.group(1)), int(m.group(2)), tzinfo=TZ)
+            data_map = {}
+            for h, v in zip(headers, updated_row):
+                key = match_header_to_field(h)
+                if key:
+                    data_map[key] = v
+            kisi = f"{data_map.get('isim', '')} {data_map.get('soyisim', '')}".strip()
+            reminder_desc = f"Vize Randevusu - {country}" + (f" ({kisi})" if kisi else "")
+            new_seq = next_seq_id(chat_id)
+            alerts_doc = [{"offset_min": mo, "sent": False} for mo in sorted(DEFAULT_ALERTS, reverse=True)]
+            reminders.insert_one({
+                "chat_id": chat_id,
+                "seq_id": new_seq,
+                "text": reminder_desc,
+                "remind_at": dt_local.astimezone(UTC),
+                "alerts": alerts_doc,
+                "created_at": datetime.now(UTC),
+            })
+            add_calendar_event(reminder_desc, dt_local)
+            reminder_note = f"\n\nBu randevu icin hatirlatici da otomatik olusturuldu (ID: #{new_seq})."
+        except Exception as e:
+            logger.error("Randevudan hatirlatici olusturulamadi: %s", e)
+
+        PENDING.pop(chat_id, None)
+        update.message.reply_text(
+            f"Randevu bilgisi islendi. '{country}' sayfasinda satir kirmiziya boyandi ve "
+            f"'{MASTER_SHEET_NAME}' sayfasina kopyalandi.{reminder_note}",
+            reply_markup=build_main_menu_keyboard(),
+        )
         return
 
     if not pending or not pending.get("awaiting_text"):
@@ -643,9 +1037,70 @@ def handle_text_input(update: Update, context: CallbackContext):
     )
 
 
+def handle_photo_message(update: Update, context: CallbackContext):
+    chat_id = update.effective_chat.id
+    pending = PENDING.get(chat_id)
+
+    if not is_authorized(chat_id):
+        update.message.reply_text(
+            "Bu botu kullanmak icin once Telegram'in 'Start' dugmesine basip erisim kodunu girin."
+        )
+        return
+
+    if not pending or not pending.get("awaiting_passport_photo"):
+        update.message.reply_text(
+            "Once Ana Menu > \U0001f6c2 Pasaport Ekle ile bir ulke secin, sonra fotografi gonderin.",
+            reply_markup=build_main_menu_keyboard(),
+        )
+        return
+
+    country = pending.get("country_sheet")
+    update.message.reply_text("Fotograf isleniyor, birkac saniye surebilir...")
+
+    try:
+        photo = update.message.photo[-1]
+        tg_file = context.bot.get_file(photo.file_id)
+        photo_bytes = bytes(tg_file.download_as_bytearray())
+    except Exception as e:
+        logger.error("Pasaport fotografi indirilemedi: %s", e)
+        update.message.reply_text("Fotograf indirilemedi, lutfen tekrar gonderin.")
+        return
+
+    raw_text = ocr_space_extract_text(photo_bytes)
+    mrz_lines = extract_mrz_lines(raw_text) if raw_text else None
+    fields, valid = (None, False)
+    if mrz_lines:
+        fields, valid = parse_mrz(mrz_lines)
+
+    if not fields:
+        update.message.reply_text(
+            "Pasaporttaki MRZ satirlari (en alttaki iki satir) okunamadi. Daha net, duz "
+            "acili bir fotoyla tekrar deneyebilir ya da bilgileri elle girebilirsiniz.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("\U0001f501 Tekrar Cek", callback_data="passport_confirm_no")],
+                [InlineKeyboardButton("✍️ Elle Gir", callback_data="passport_manual_start")],
+            ]),
+        )
+        return
+
+    pending["mrz_fields"] = fields
+    pending.pop("awaiting_passport_photo", None)
+    ozet = "\n".join(f"{FIELD_LABELS.get(k, k)}: {v or '(bos)'}" for k, v in fields.items())
+    uyari = "" if valid else "\n\n⚠️ Kontrol basamagi dogrulanamadi, bilgileri dikkatlice kontrol edin."
+    update.message.reply_text(
+        f"Pasaporttan okunanlar ('{country}' sayfasi icin):\n{ozet}{uyari}\n\nDogru mu?",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Dogru, Devam Et", callback_data="passport_confirm_yes")],
+            [InlineKeyboardButton("\U0001f501 Tekrar Cek", callback_data="passport_confirm_no")],
+            [InlineKeyboardButton("✍️ Elle Gir", callback_data="passport_manual_start")],
+        ]),
+    )
+
+
 dispatcher.add_handler(CommandHandler("start", start))
 dispatcher.add_handler(CallbackQueryHandler(button_router))
 dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_text_input))
+dispatcher.add_handler(MessageHandler(Filters.photo, handle_photo_message))
 
 
 # ---------------------------------------------------------------------------
@@ -680,10 +1135,7 @@ def check_due_reminders():
             trigger_time = remind_at - timedelta(minutes=alert["offset_min"])
             if now_utc >= trigger_time:
                 msg = alert_message(r["text"], remind_at_local, alert["offset_min"])
-                try:
-                    bot.send_message(chat_id=r["chat_id"], text=msg)
-                except Exception as e:
-                    logger.error("Telegram mesaji gonderilemedi: %s", e)
+                broadcast_message(msg)
                 send_email("Hatirlatici", msg)
                 send_sms(msg)
                 alert["sent"] = True
@@ -838,27 +1290,21 @@ def send_telegram_file(chat_id, filename, data, content_type):
 def notify_new_mail(provider, sender, subject, body, attachments=None):
     if not mail_matches_filter(sender, subject, body):
         return
-    chat_id = get_primary_chat_id()
-    if not chat_id:
+    chat_ids = get_authorized_chat_ids()
+    if not chat_ids:
         return
     body_clean = (body or "").strip() or "(govde metni yok)"
     text = f"\U0001f4e7 Yeni e-posta ({provider})\nKimden: {sender}\nKonu: {subject}\n\n{body_clean}"
-    try:
-        bot.send_message(chat_id=chat_id, text=text)
-    except Exception as e:
-        logger.error("Mail bildirimi gonderilemedi: %s", e)
+    broadcast_message(text)
 
     for att in (attachments or []):
         if len(att["data"]) > MAIL_ATTACHMENT_MAX_BYTES:
-            try:
-                bot.send_message(
-                    chat_id=chat_id,
-                    text=f"(Ek dosya '{att['filename']}' {MAIL_ATTACHMENT_MAX_MB:.0f} MB sinirindan buyuk oldugu icin gonderilemedi)",
-                )
-            except Exception:
-                pass
+            broadcast_message(
+                f"(Ek dosya '{att['filename']}' {MAIL_ATTACHMENT_MAX_MB:.0f} MB sinirindan buyuk oldugu icin gonderilemedi)"
+            )
             continue
-        send_telegram_file(chat_id, att["filename"], att["data"], att["content_type"])
+        for cid in chat_ids:
+            send_telegram_file(cid, att["filename"], att["data"], att["content_type"])
 
 
 def get_last_uid(account_key):
@@ -1041,8 +1487,341 @@ def check_new_mail():
         poll_outlook_account(idx, token_env)
 
 
+# =============================================================================
+# PASAPORT -> GOOGLE SHEETS ENTEGRASYONU
+# =============================================================================
+SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+
+def get_sheets_service():
+    if not GOOGLE_LIBS_AVAILABLE:
+        return None
+    if not (GOOGLE_SERVICE_ACCOUNT_JSON and SHEETS_SPREADSHEET_ID):
+        return None
+    try:
+        info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+        creds = ServiceAccountCredentials.from_service_account_info(info, scopes=SHEETS_SCOPES)
+        return build("sheets", "v4", credentials=creds, cache_discovery=False)
+    except Exception as e:
+        logger.error("Sheets servisi olusturulamadi: %s", e)
+        return None
+
+
+# --- Sutun basligi eslestirme (sayfalar arasi farkli isimlendirmeleri toparlar) ---
+FIELD_SYNONYMS = {
+    "id": ["id", "sira"],
+    "isim": ["isim", "ad"],
+    "soyisim": ["soyisim", "soyad"],
+    "pasaport_no": ["pasaport no"],
+    "dogum_tarihi": ["dogum tarihi"],
+    "pasaport_skt": ["pasaport skt", "pasaport son kullanma tarihi"],
+    "uyruk": ["uyruk"],
+    "kimlik_no": ["kimlik no"],
+    "vize_turu": ["vize turu"],
+    "islemi_yapan": ["islemi yapan", "islem yapan"],
+    "mail": ["mail", "mail adresi", "e posta"],
+    "sifre": ["sifre", "parola"],
+    "tel": ["tel", "telefon"],
+    "referans": ["referans"],
+    "randevu_gunu": ["randevu gunu"],
+    "saat": ["saat"],
+    "islem_sonucu": ["islem sonucu"],
+}
+
+
+def normalize_header(s):
+    s = (s or "").strip().lower()
+    s = (
+        s.replace("ı", "i").replace("i̇", "i").replace("ş", "s").replace("ğ", "g")
+        .replace("ü", "u").replace("ö", "o").replace("ç", "c")
+    )
+    s = re.sub(r"[^a-z0-9]+", " ", s).strip()
+    return s
+
+
+def match_header_to_field(header_text):
+    norm = normalize_header(header_text)
+    for field_key, variants in FIELD_SYNONYMS.items():
+        if norm in variants:
+            return field_key
+    return None
+
+
+def colnum_to_letter(n):
+    letters = ""
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters or "A"
+
+
+def get_sheet_metadata(service):
+    return service.spreadsheets().get(spreadsheetId=SHEETS_SPREADSHEET_ID).execute()
+
+
+def list_country_sheets(service):
+    """
+    Google Sheets'teki sayfa isimlerini CANLI okur - yeni bir ulke sayfasi
+    eklendiginde bot kodunda hicbir degisiklik gerekmez, otomatik gorur.
+    """
+    meta = get_sheet_metadata(service)
+    names = []
+    for sh in meta.get("sheets", []):
+        title = sh["properties"]["title"]
+        if title in (MASTER_SHEET_NAME, ACCOUNTS_SHEET_NAME):
+            continue
+        names.append(title)
+    return names
+
+
+def get_sheet_id_map(service):
+    meta = get_sheet_metadata(service)
+    return {sh["properties"]["title"]: sh["properties"]["sheetId"] for sh in meta.get("sheets", [])}
+
+
+def get_sheet_headers(service, sheet_name):
+    result = service.spreadsheets().values().get(
+        spreadsheetId=SHEETS_SPREADSHEET_ID, range=f"'{sheet_name}'!1:1"
+    ).execute()
+    values = result.get("values", [])
+    return values[0] if values else []
+
+
+def get_column_a_values(service, sheet_name):
+    result = service.spreadsheets().values().get(
+        spreadsheetId=SHEETS_SPREADSHEET_ID, range=f"'{sheet_name}'!A:A"
+    ).execute()
+    return result.get("values", [])
+
+
+def get_next_id_and_row(service, sheet_name):
+    col_a = get_column_a_values(service, sheet_name)
+    max_id = 0
+    for row in col_a[1:]:
+        if row:
+            try:
+                v = int(float(str(row[0]).strip()))
+                if v > max_id:
+                    max_id = v
+            except Exception:
+                continue
+    next_row_index = len(col_a) + 1
+    return max_id + 1, next_row_index
+
+
+COLOR_MAP = {
+    "yellow": {"red": 1.0, "green": 0.93, "blue": 0.55},
+    "red": {"red": 0.96, "green": 0.5, "blue": 0.5},
+}
+
+
+def set_row_color(service, sheet_name, row_index, color_name):
+    sheet_ids = get_sheet_id_map(service)
+    sheet_id = sheet_ids.get(sheet_name)
+    if sheet_id is None:
+        return
+    color = COLOR_MAP.get(color_name)
+    if not color:
+        return
+    body = {
+        "requests": [{
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": row_index - 1,
+                    "endRowIndex": row_index,
+                },
+                "cell": {"userEnteredFormat": {"backgroundColor": color}},
+                "fields": "userEnteredFormat.backgroundColor",
+            }
+        }]
+    }
+    try:
+        service.spreadsheets().batchUpdate(spreadsheetId=SHEETS_SPREADSHEET_ID, body=body).execute()
+    except Exception as e:
+        logger.error("Satir renklendirilemedi: %s", e)
+
+
+def write_passport_row(service, sheet_name, field_values):
+    headers = get_sheet_headers(service, sheet_name)
+    if not headers:
+        return None
+    next_id, row_index = get_next_id_and_row(service, sheet_name)
+    row = []
+    for h in headers:
+        key = match_header_to_field(h)
+        if key == "id":
+            row.append(next_id)
+        elif key and key in field_values:
+            row.append(field_values[key])
+        else:
+            row.append("")
+    service.spreadsheets().values().update(
+        spreadsheetId=SHEETS_SPREADSHEET_ID,
+        range=f"'{sheet_name}'!A{row_index}",
+        valueInputOption="USER_ENTERED",
+        body={"values": [row]},
+    ).execute()
+    set_row_color(service, sheet_name, row_index, "yellow")
+    return next_id, row_index
+
+
+def find_row_by_id(service, sheet_name, target_id):
+    col_a = get_column_a_values(service, sheet_name)
+    for i, row in enumerate(col_a, start=1):
+        if i == 1 or not row:
+            continue
+        try:
+            v = int(float(str(row[0]).strip()))
+        except Exception:
+            continue
+        if v == target_id:
+            headers = get_sheet_headers(service, sheet_name)
+            last_col = colnum_to_letter(len(headers))
+            result = service.spreadsheets().values().get(
+                spreadsheetId=SHEETS_SPREADSHEET_ID,
+                range=f"'{sheet_name}'!A{i}:{last_col}{i}",
+            ).execute()
+            values = result.get("values", [[]])
+            row_values = values[0] if values else []
+            return i, headers, row_values
+    return None, None, None
+
+
+def copy_to_master(service, headers, row_values, extra_fields):
+    data = {}
+    for h, v in zip(headers, row_values):
+        key = match_header_to_field(h)
+        if key:
+            data[key] = v
+    data.update(extra_fields)
+
+    master_headers = get_sheet_headers(service, MASTER_SHEET_NAME)
+    if not master_headers:
+        return
+    _, next_row = get_next_id_and_row(service, MASTER_SHEET_NAME)
+    new_row = []
+    for h in master_headers:
+        key = match_header_to_field(h)
+        if key == "id":
+            new_row.append(next_row - 1)
+        elif key and key in data:
+            new_row.append(data[key])
+        else:
+            new_row.append("")
+    service.spreadsheets().values().update(
+        spreadsheetId=SHEETS_SPREADSHEET_ID,
+        range=f"'{MASTER_SHEET_NAME}'!A{next_row}",
+        valueInputOption="USER_ENTERED",
+        body={"values": [new_row]},
+    ).execute()
+
+
+def apply_extra_fields_to_row(service, sheet_name, row_index, headers, row_values, extra_fields):
+    """
+    Var olan bir satirdaki (orn. randevu bilgileri) belirli sutunlari,
+    diger sutunlara dokunmadan gunceller. row_values, find_row_by_id'den
+    gelen mevcut hucre degerleridir - eksik hucreler bos string sayilir.
+    Guncellenmis satiri geri dondurur (master'a kopyalarken kullanilabilsin diye).
+    """
+    row_values = list(row_values) + [""] * max(0, len(headers) - len(row_values))
+    for i, h in enumerate(headers):
+        key = match_header_to_field(h)
+        if key and key in extra_fields:
+            row_values[i] = extra_fields[key]
+    last_col = colnum_to_letter(len(headers))
+    try:
+        service.spreadsheets().values().update(
+            spreadsheetId=SHEETS_SPREADSHEET_ID,
+            range=f"'{sheet_name}'!A{row_index}:{last_col}{row_index}",
+            valueInputOption="USER_ENTERED",
+            body={"values": [row_values]},
+        ).execute()
+    except Exception as e:
+        logger.error("Satir guncellenemedi: %s", e)
+    return row_values
+
+
+# --- Pasaport OCR (OCR.space) + MRZ ayristirma ---
+def ocr_space_extract_text(image_bytes):
+    if not OCR_SPACE_API_KEY:
+        return None
+    try:
+        r = requests.post(
+            "https://api.ocr.space/parse/image",
+            files={"file": ("pasaport.jpg", image_bytes)},
+            data={"apikey": OCR_SPACE_API_KEY, "language": "eng", "OCREngine": "2", "scale": "true"},
+            timeout=30,
+        )
+        result = r.json()
+        if result.get("IsErroredOnProcessing"):
+            logger.error("OCR hatasi: %s", result.get("ErrorMessage"))
+            return None
+        parsed = result.get("ParsedResults", [])
+        if not parsed:
+            return None
+        return parsed[0].get("ParsedText", "")
+    except Exception as e:
+        logger.error("OCR istegi basarisiz: %s", e)
+        return None
+
+
+def extract_mrz_lines(raw_text):
+    if not raw_text:
+        return None
+    candidates = []
+    for line in raw_text.splitlines():
+        cleaned = line.strip().upper().replace(" ", "")
+        if re.fullmatch(r"[A-Z0-9<]{30,44}", cleaned):
+            candidates.append(cleaned)
+    if len(candidates) < 2:
+        return None
+    last_two = candidates[-2:]
+    return [c.ljust(44, "<")[:44] for c in last_two]
+
+
+def mrz_date_to_ddmmyyyy(yymmdd, is_expiry=False):
+    try:
+        yy = int(yymmdd[0:2])
+        mm = yymmdd[2:4]
+        dd = yymmdd[4:6]
+    except Exception:
+        return ""
+    current_yy = datetime.now().year % 100
+    if is_expiry:
+        year = 2000 + yy
+    else:
+        year = 2000 + yy if yy <= current_yy else 1900 + yy
+    return f"{dd}.{mm}.{year}"
+
+
+def parse_mrz(lines):
+    if not MRZ_LIB_AVAILABLE:
+        return None, False
+    try:
+        checker = TD3CodeChecker("\n".join(lines))
+        raw = checker.fields()
+        valid = bool(checker)
+    except Exception as e:
+        logger.error("MRZ ayristirma hatasi: %s", e)
+        return None, False
+
+    fields = {
+        "isim": (raw.get("name") or "").replace("<", " ").strip(),
+        "soyisim": (raw.get("surname") or "").replace("<", " ").strip(),
+        "pasaport_no": (raw.get("document_number") or "").replace("<", "").strip(),
+        "dogum_tarihi": mrz_date_to_ddmmyyyy(raw.get("birth_date") or "", is_expiry=False),
+        "pasaport_skt": mrz_date_to_ddmmyyyy(raw.get("expiry_date") or "", is_expiry=True),
+        "uyruk": (raw.get("nationality") or "").strip(),
+        "kimlik_no": (raw.get("personal_number") or "").replace("<", "").strip(),
+    }
+    return fields, valid
+
+
+REMINDER_CHECK_INTERVAL_SECONDS = int(os.environ.get("REMINDER_CHECK_INTERVAL_SECONDS", "20"))
+
 scheduler = BackgroundScheduler(timezone="UTC")
-scheduler.add_job(check_due_reminders, "interval", seconds=60, max_instances=1)
+scheduler.add_job(check_due_reminders, "interval", seconds=REMINDER_CHECK_INTERVAL_SECONDS, max_instances=1)
 scheduler.add_job(check_new_mail, "interval", seconds=MAIL_CHECK_INTERVAL_SECONDS, max_instances=1)
 scheduler.start()
 
