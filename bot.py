@@ -449,6 +449,7 @@ def build_main_menu_keyboard():
         [InlineKeyboardButton("\U0001f5d1 Hatirlatici Sil", callback_data="delprompt")],
         [InlineKeyboardButton("\U0001f6c2 Pasaport Ekle", callback_data="passport_add")],
         [InlineKeyboardButton("✅ Randevu Aldim", callback_data="appt_start")],
+        [InlineKeyboardButton("\U0001f4cb Pasaport Kayitlarini Gor", callback_data="passport_list_start")],
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -794,7 +795,7 @@ def button_router(update: Update, context: CallbackContext):
                 logger.error("Kayit listesi alinamadi: %s", e)
                 records = []
             if records:
-                lines = [f"#{rid} - {isim}" if isim else f"#{rid}" for rid, isim in records[:50]]
+                lines = [f"#{rid} - {isim}" if isim else f"#{rid}" for rid, isim, _ in records[:50]]
                 records_text = "\n\nBekleyen kayitlar:\n" + "\n".join(lines)
             else:
                 records_text = "\n\n(Bu sayfada bekleyen kayit gorunmuyor.)"
@@ -804,6 +805,57 @@ def button_router(update: Update, context: CallbackContext):
             f"'{country}' sayfasindaki kaydin ID numarasini yazip gonderin (sadece sayi, orn. 5)."
             f"{records_text}",
         )
+        return
+
+    # --- Pasaport kayitlarini goruntuleme (sadece listeleme, duzenlemez) ---
+    if data == "passport_list_start":
+        query.answer()
+        service = get_sheets_service()
+        if not service:
+            replace_ui(
+                query,
+                "Google Sheets baglantisi kurulu degil. Lutfen once GOOGLE_SERVICE_ACCOUNT_JSON "
+                "ve SHEETS_SPREADSHEET_ID ayarlarini tamamlayin.",
+                build_main_menu_keyboard(),
+            )
+            return
+        keyboard, names = build_country_keyboard(service, "passport_list_country")
+        if not names:
+            replace_ui(query, "Tabloda hicbir ulke sayfasi bulunamadi.", build_main_menu_keyboard())
+            return
+        PENDING[chat_id] = {"country_list": names}
+        replace_ui(query, "Hangi ulke sayfasindaki kayitlari gormek istiyorsun?", keyboard)
+        return
+
+    if data.startswith("passport_list_country|"):
+        _, idx = data.split("|")
+        pending = PENDING.get(chat_id, {})
+        names = pending.get("country_list", [])
+        try:
+            country = names[int(idx)]
+        except Exception:
+            query.answer("Gecersiz secim, tekrar deneyin.", show_alert=True)
+            return
+        query.answer()
+        PENDING.pop(chat_id, None)
+
+        service = get_sheets_service()
+        try:
+            records = list_country_records(service, country, only_pending=False)
+        except Exception as e:
+            logger.error("Kayit listesi alinamadi: %s", e)
+            records = []
+
+        if not records:
+            text = f"'{country}' sayfasinda kayit bulunamadi."
+        else:
+            lines = []
+            for rid, isim, sonuc in records[:80]:
+                durum = "✅ Randevu Alindi" if sonuc else "\U0001f7e1 Bekliyor"
+                lines.append(f"#{rid} - {isim or '(isimsiz)'} - {durum}")
+            text = f"'{country}' sayfasindaki kayitlar:\n\n" + "\n".join(lines)
+
+        replace_ui(query, text, build_main_menu_keyboard())
         return
 
     query.answer()
@@ -1804,10 +1856,11 @@ def list_country_records(service, sheet_name, only_pending=True):
         rid = cell(row, id_col)
         if not rid:
             continue
-        if only_pending and cell(row, sonuc_col):
+        sonuc = cell(row, sonuc_col)
+        if only_pending and sonuc:
             continue
         isim = f"{cell(row, isim_col)} {cell(row, soyisim_col)}".strip()
-        records.append((rid, isim))
+        records.append((rid, isim, sonuc))
     return records
 
 
