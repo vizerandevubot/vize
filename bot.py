@@ -1,6 +1,8 @@
 import os
 import re
+import html as html_lib
 import base64
+import mimetypes
 import imaplib
 import email as email_lib
 import logging
@@ -12,7 +14,13 @@ from zoneinfo import ZoneInfo
 from email.header import decode_header
 
 from flask import Flask, request
-from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    Bot,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+)
 from telegram.ext import (
     Dispatcher,
     CommandHandler,
@@ -352,26 +360,9 @@ def build_calendar_keyboard(year, month):
     return InlineKeyboardMarkup(rows)
 
 
-def build_hour_keyboard():
-    rows = []
-    hours = list(range(24))
-    for i in range(0, 24, 6):
-        rows.append(
-            [InlineKeyboardButton(f"{h:02d}", callback_data=f"hour|{h}") for h in hours[i:i + 6]]
-        )
-    rows.append([InlineKeyboardButton("\U0001f3e0 Ana Menu", callback_data="menu")])
-    return InlineKeyboardMarkup(rows)
-
-
-def build_minute_keyboard():
-    minutes = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55]
-    rows = []
-    for i in range(0, len(minutes), 4):
-        rows.append(
-            [InlineKeyboardButton(f":{m:02d}", callback_data=f"min|{m}") for m in minutes[i:i + 4]]
-        )
-    rows.append([InlineKeyboardButton("\U0001f3e0 Ana Menu", callback_data="menu")])
-    return InlineKeyboardMarkup(rows)
+TIME_ENTRY_KEYBOARD = InlineKeyboardMarkup(
+    [[InlineKeyboardButton("\U0001f3e0 Ana Menu", callback_data="menu")]]
+)
 
 
 def build_alert_keyboard(chat_id):
@@ -383,6 +374,13 @@ def build_alert_keyboard(chat_id):
     rows.append([InlineKeyboardButton("Devam Et ➡️", callback_data="alertdone")])
     rows.append([InlineKeyboardButton("\U0001f3e0 Ana Menu", callback_data="menu")])
     return InlineKeyboardMarkup(rows)
+
+
+MENU_BUTTON_TEXT = "☰ Menü"
+
+# Sohbetin en altinda, mesajlar arasinda kaybolmayan sabit klavye. Ana
+# menuyu her zaman tek dokunusla acmak icin.
+PERSISTENT_KEYBOARD = ReplyKeyboardMarkup([[MENU_BUTTON_TEXT]], resize_keyboard=True)
 
 
 def build_main_menu_keyboard():
@@ -419,9 +417,11 @@ def start(update: Update, context: CallbackContext):
     set_primary_chat_id(chat_id)
     update.message.reply_text(
         "Merhaba! Ben is ajandanizim. Hatirlaticilarinizi ve gelen onemli "
-        "mailleri buradan takip edeceksiniz - hepsi asagidaki butonlarla.",
-        reply_markup=build_main_menu_keyboard(),
+        "mailleri buradan takip edeceksiniz - hepsi asagidaki butonlarla.\n\n"
+        f"Klavyenizdeki '{MENU_BUTTON_TEXT}' butonuna her an basarak ana menuye donebilirsiniz.",
+        reply_markup=PERSISTENT_KEYBOARD,
     )
+    update.message.reply_text("Ana Menu:", reply_markup=build_main_menu_keyboard())
 
 
 # ---------------------------------------------------------------------------
@@ -487,29 +487,15 @@ def button_router(update: Update, context: CallbackContext):
     if data.startswith("day|"):
         _, year, month, day = data.split("|")
         PENDING.setdefault(chat_id, {})
-        PENDING[chat_id].update({"year": int(year), "month": int(month), "day": int(day)})
-        query.answer()
-        replace_ui(query, "Simdi saati secin:", build_hour_keyboard())
-        return
-
-    if data.startswith("hour|"):
-        _, hour = data.split("|")
-        PENDING.setdefault(chat_id, {})
-        PENDING[chat_id]["hour"] = int(hour)
-        query.answer()
-        replace_ui(query, "Simdi dakikayi secin (5 dakikalik araliklarla):", build_minute_keyboard())
-        return
-
-    if data.startswith("min|"):
-        _, minute = data.split("|")
-        PENDING.setdefault(chat_id, {})
-        PENDING[chat_id]["minute"] = int(minute)
-        PENDING[chat_id]["alerts"] = set(DEFAULT_ALERTS)
+        PENDING[chat_id].update({
+            "year": int(year), "month": int(month), "day": int(day),
+            "awaiting_time_text": True,
+        })
         query.answer()
         replace_ui(
             query,
-            "Ne zaman hatirlatayim? (Birden fazla secebilirsiniz)",
-            build_alert_keyboard(chat_id),
+            "Saati yazip gonderin (SS:DD formatinda, ornek: 09:15 ya da 14:30):",
+            TIME_ENTRY_KEYBOARD,
         )
         return
 
@@ -563,9 +549,35 @@ def button_router(update: Update, context: CallbackContext):
     query.answer()
 
 
+TIME_PATTERN = re.compile(r"^\s*([01]?\d|2[0-3])\s*[:.]\s*([0-5]\d)\s*$")
+
+
 def handle_text_input(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
     pending = PENDING.get(chat_id)
+    raw_text = update.message.text.strip()
+
+    if raw_text == MENU_BUTTON_TEXT:
+        PENDING.pop(chat_id, None)
+        update.message.reply_text("Ana Menu:", reply_markup=build_main_menu_keyboard())
+        return
+
+    if pending and pending.get("awaiting_time_text"):
+        m = TIME_PATTERN.match(raw_text)
+        if not m:
+            update.message.reply_text(
+                "Format hatali. Saat:Dakika seklinde yazin, ornek: 09:15"
+            )
+            return
+        pending["hour"] = int(m.group(1))
+        pending["minute"] = int(m.group(2))
+        pending.pop("awaiting_time_text", None)
+        pending["alerts"] = set(DEFAULT_ALERTS)
+        update.message.reply_text(
+            "Ne zaman hatirlatayim? (Birden fazla secebilirsiniz)",
+            reply_markup=build_alert_keyboard(chat_id),
+        )
+        return
 
     if pending and pending.get("awaiting_delete_id"):
         raw = update.message.text.strip().lstrip("#")
@@ -702,37 +714,65 @@ def decode_mime_words(s):
     return decoded
 
 
-def get_email_body_snippet(msg, limit=300):
+def looks_like_html(s):
+    return bool(re.search(r"<\s*(html|!doctype|div|table|span|br|p|body)\b", s, re.IGNORECASE))
+
+
+def html_to_text(raw_html):
+    # script/style bloklarini icerigiyle birlikte kaldir
+    text = re.sub(r"(?is)<(script|style)\b.*?</\1\s*>", " ", raw_html)
+    # kalan tum etiketleri kaldir
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    # &nbsp; &amp; gibi HTML karakter kodlarini normal metne cevir
+    text = html_lib.unescape(text)
+    return " ".join(text.split())
+
+
+def get_email_body_snippet(msg, limit=500):
     body = ""
+    html_fallback = ""
     if msg.is_multipart():
         for part in msg.walk():
             ctype = part.get_content_type()
             disp = str(part.get("Content-Disposition") or "")
-            if ctype == "text/plain" and "attachment" not in disp:
+            if "attachment" in disp.lower():
+                continue
+            if ctype == "text/plain" and not body:
                 charset = part.get_content_charset() or "utf-8"
                 try:
-                    body = part.get_payload(decode=True).decode(charset, errors="replace")
+                    candidate = part.get_payload(decode=True).decode(charset, errors="replace")
                 except Exception:
-                    body = ""
-                if body:
-                    break
-        if not body:
-            for part in msg.walk():
-                if part.get_content_type() == "text/html":
-                    charset = part.get_content_charset() or "utf-8"
-                    try:
-                        html = part.get_payload(decode=True).decode(charset, errors="replace")
-                        body = re.sub("<[^<]+?>", " ", html)
-                    except Exception:
-                        pass
-                    break
+                    candidate = ""
+                # Bazi gonderenler "duz metin" alaninin icine de ham HTML
+                # koyuyor - bunu fark edip yine de HTML gibi temizleyelim.
+                if candidate and not looks_like_html(candidate):
+                    body = candidate
+                elif candidate:
+                    html_fallback = html_fallback or candidate
+            elif ctype == "text/html" and not html_fallback:
+                charset = part.get_content_charset() or "utf-8"
+                try:
+                    html_fallback = part.get_payload(decode=True).decode(charset, errors="replace")
+                except Exception:
+                    pass
     else:
+        ctype = msg.get_content_type()
         charset = msg.get_content_charset() or "utf-8"
         try:
             payload = msg.get_payload(decode=True)
-            body = payload.decode(charset, errors="replace") if payload else str(msg.get_payload())
+            raw = payload.decode(charset, errors="replace") if payload else str(msg.get_payload())
         except Exception:
-            body = str(msg.get_payload())
+            raw = str(msg.get_payload())
+        if ctype == "text/html" or looks_like_html(raw):
+            html_fallback = raw
+        else:
+            body = raw
+
+    if not body and html_fallback:
+        body = html_to_text(html_fallback)
+    elif body and looks_like_html(body):
+        body = html_to_text(body)
+
     body = " ".join(body.split())
     return body[:limit]
 
@@ -746,19 +786,22 @@ def mail_matches_filter(sender, subject, body):
 
 def extract_attachments(msg):
     """
-    Bir e-postadaki tum dosyalari (ek olarak eklenmis veya govde icine
-    gomulmus resimler dahil - ornegin OTP kodu resmi) cikarir. Dosya adi
-    olan her parcayi bir ek olarak kabul eder.
+    Bir e-postadaki tum dosyalari cikarir: hem normal ekler (PDF, Word vb.)
+    hem de govde icine gomulu, dosya adi OLMAYAN resimler (ornegin bazi
+    saglayicilarin OTP kodu resimleri - bunlar sadece Content-ID ile
+    referanslanir, ayri bir dosya adi tasimaz).
     """
     attachments = []
     if not msg.is_multipart():
         return attachments
+    counter = 0
     for part in msg.walk():
         ctype = part.get_content_type()
-        if ctype in ("multipart/mixed", "multipart/alternative", "multipart/related"):
+        if ctype in ("multipart/mixed", "multipart/alternative", "multipart/related", "text/plain", "text/html"):
             continue
         filename = part.get_filename()
-        if not filename:
+        content_id = part.get("Content-ID")
+        if not filename and not content_id:
             continue
         try:
             data = part.get_payload(decode=True)
@@ -766,8 +809,14 @@ def extract_attachments(msg):
             data = None
         if not data:
             continue
+        if filename:
+            filename = decode_mime_words(filename)
+        else:
+            counter += 1
+            ext = mimetypes.guess_extension(ctype.split(";")[0].strip()) or ""
+            filename = f"resim_{counter}{ext}"
         attachments.append({
-            "filename": decode_mime_words(filename),
+            "filename": filename,
             "data": data,
             "content_type": ctype,
         })
@@ -792,7 +841,8 @@ def notify_new_mail(provider, sender, subject, body, attachments=None):
     chat_id = get_primary_chat_id()
     if not chat_id:
         return
-    text = f"\U0001f4e7 Yeni e-posta ({provider})\nKimden: {sender}\nKonu: {subject}\n\n{body[:300]}"
+    body_clean = (body or "").strip() or "(govde metni yok)"
+    text = f"\U0001f4e7 Yeni e-posta ({provider})\nKimden: {sender}\nKonu: {subject}\n\n{body_clean}"
     try:
         bot.send_message(chat_id=chat_id, text=text)
     except Exception as e:
