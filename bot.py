@@ -74,6 +74,9 @@ EMAILJS_TEMPLATE_ID = os.environ.get("EMAILJS_TEMPLATE_ID")
 EMAILJS_PUBLIC_KEY = os.environ.get("EMAILJS_PUBLIC_KEY")
 EMAILJS_PRIVATE_KEY = os.environ.get("EMAILJS_PRIVATE_KEY")
 USER_EMAIL = os.environ.get("USER_EMAIL")
+# Birden fazla adrese hatirlatici e-postasi gitsin isterseniz virgulle ayirin:
+# USER_EMAIL=birinci@gmail.com,ikinci@gmail.com,ucuncu@gmail.com
+USER_EMAILS = [e.strip() for e in (USER_EMAIL or "").split(",") if e.strip()]
 
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
@@ -341,21 +344,24 @@ def add_calendar_event(text, dt_local):
 
 
 def send_email(subject, body):
-    if not (EMAILJS_SERVICE_ID and EMAILJS_TEMPLATE_ID and EMAILJS_PUBLIC_KEY and USER_EMAIL):
+    if not (EMAILJS_SERVICE_ID and EMAILJS_TEMPLATE_ID and EMAILJS_PUBLIC_KEY and USER_EMAILS):
         return
-    payload = {
-        "service_id": EMAILJS_SERVICE_ID,
-        "template_id": EMAILJS_TEMPLATE_ID,
-        "user_id": EMAILJS_PUBLIC_KEY,
-        "accessToken": EMAILJS_PRIVATE_KEY,
-        "template_params": {"to_email": USER_EMAIL, "subject": subject, "message": body},
-    }
-    try:
-        r = requests.post("https://api.emailjs.com/api/v1.0/email/send", json=payload, timeout=10)
-        if r.status_code != 200:
-            logger.error("EmailJS hatasi: %s %s", r.status_code, r.text)
-    except Exception as e:
-        logger.error("E-posta gonderilemedi: %s", e)
+    # USER_EMAIL virgulle birden fazla adres icerebilir - her birine ayri
+    # gonderiyoruz (EmailJS'in ucretsiz sablonlari tek aliciya gore kurulu).
+    for addr in USER_EMAILS:
+        payload = {
+            "service_id": EMAILJS_SERVICE_ID,
+            "template_id": EMAILJS_TEMPLATE_ID,
+            "user_id": EMAILJS_PUBLIC_KEY,
+            "accessToken": EMAILJS_PRIVATE_KEY,
+            "template_params": {"to_email": addr, "subject": subject, "message": body},
+        }
+        try:
+            r = requests.post("https://api.emailjs.com/api/v1.0/email/send", json=payload, timeout=10)
+            if r.status_code != 200:
+                logger.error("EmailJS hatasi (%s): %s %s", addr, r.status_code, r.text)
+        except Exception as e:
+            logger.error("E-posta gonderilemedi (%s): %s", addr, e)
 
 
 def send_sms(body):
