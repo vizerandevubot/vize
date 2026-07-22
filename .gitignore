@@ -1,15 +1,14 @@
 # Gercek sifre/token iceren dosyalar - ASLA GitHub'a yuklenmemeli
 .env
 client_secret.json
- 
+
 # Python
 __pycache__/
 *.pyc
 .venv/
 venv/
- 
+
 # Isletim sistemi / editor
 .DS_Store
 .vscode/
 .idea/
- 
