@@ -774,9 +774,28 @@ def button_router(update: Update, context: CallbackContext):
             return
         query.answer()
         PENDING[chat_id] = {"country_sheet": country, "awaiting_appt_id": True}
+
+        # Kullanicinin ID'yi tabloya bakip ezberlemesine gerek kalmasin diye,
+        # bekleyen (henuz randevu alinmamis) kayitlarin ID + isim listesini
+        # burada gosteriyoruz.
+        service = get_sheets_service()
+        records_text = ""
+        if service:
+            try:
+                records = list_country_records(service, country, only_pending=True)
+            except Exception as e:
+                logger.error("Kayit listesi alinamadi: %s", e)
+                records = []
+            if records:
+                lines = [f"#{rid} - {isim}" if isim else f"#{rid}" for rid, isim in records[:50]]
+                records_text = "\n\nBekleyen kayitlar:\n" + "\n".join(lines)
+            else:
+                records_text = "\n\n(Bu sayfada bekleyen kayit gorunmuyor.)"
+
         replace_ui(
             query,
-            f"'{country}' sayfasindaki kaydin ID numarasini yazip gonderin (sadece sayi, orn. 5).",
+            f"'{country}' sayfasindaki kaydin ID numarasini yazip gonderin (sadece sayi, orn. 5)."
+            f"{records_text}",
         )
         return
 
@@ -1599,33 +1618,70 @@ def get_sheet_id_map(service):
     return {sh["properties"]["title"]: sh["properties"]["sheetId"] for sh in meta.get("sheets", [])}
 
 
-def get_sheet_headers(service, sheet_name):
+def get_sheet_grid(service, sheet_name):
+    """
+    Sayfadaki KULLANILAN tum hucreleri (satir x sutun) tek seferde okur.
+    Sadece 'A:A' gibi tek bir sutuna bakmak yaniltici olabiliyor: yeni
+    eklenen 'ID' sutunu bos oldugu icin Sheets API o sutunu erken kesebiliyor
+    ve bot mevcut verilerin/basliklarin uzerine yaziyordu. Butun sayfayi
+    okuyup satir sayisini oradan hesaplamak bu sorunu onler.
+    """
     result = service.spreadsheets().values().get(
-        spreadsheetId=SHEETS_SPREADSHEET_ID, range=f"'{sheet_name}'!1:1"
-    ).execute()
-    values = result.get("values", [])
-    return values[0] if values else []
-
-
-def get_column_a_values(service, sheet_name):
-    result = service.spreadsheets().values().get(
-        spreadsheetId=SHEETS_SPREADSHEET_ID, range=f"'{sheet_name}'!A:A"
+        spreadsheetId=SHEETS_SPREADSHEET_ID, range=f"'{sheet_name}'"
     ).execute()
     return result.get("values", [])
 
 
-def get_next_id_and_row(service, sheet_name):
-    col_a = get_column_a_values(service, sheet_name)
+def get_header_row(service, sheet_name, grid=None):
+    """
+    Baslik satirinin HER ZAMAN 1. satir olacagini varsaymiyoruz - bazi
+    sayfalarda 1. satir bir baslik/banner olabilir, gercek sutun adlari
+    (ID, isim, soyisim...) 2. satirda olabilir. Ilk birkac satiri tarayip
+    tanidik alan adiyla EN COK eslesen satiyi baslik satiri kabul ediyoruz.
+    Donus: (baslik_satiri_1_indeksli, baslik_degerleri_listesi)
+    """
+    if grid is None:
+        grid = get_sheet_grid(service, sheet_name)
+    if not grid:
+        return 1, []
+    best_idx, best_score = 0, -1
+    for i, row in enumerate(grid[:5]):
+        score = sum(1 for cell in row if match_header_to_field(cell))
+        if score > best_score:
+            best_score, best_idx = score, i
+    return best_idx + 1, grid[best_idx]
+
+
+def get_sheet_headers(service, sheet_name):
+    _, headers = get_header_row(service, sheet_name)
+    return headers
+
+
+def get_next_id_and_row(service, sheet_name, grid=None):
+    if grid is None:
+        grid = get_sheet_grid(service, sheet_name)
+    header_row_idx, headers = get_header_row(service, sheet_name, grid)
+
+    id_col = None
+    for i, h in enumerate(headers):
+        if match_header_to_field(h) == "id":
+            id_col = i
+            break
+
     max_id = 0
-    for row in col_a[1:]:
-        if row:
-            try:
-                v = int(float(str(row[0]).strip()))
-                if v > max_id:
-                    max_id = v
-            except Exception:
-                continue
-    next_row_index = len(col_a) + 1
+    if id_col is not None:
+        for row in grid[header_row_idx:]:
+            if len(row) > id_col and row[id_col]:
+                try:
+                    v = int(float(str(row[id_col]).strip()))
+                    if v > max_id:
+                        max_id = v
+                except Exception:
+                    continue
+
+    # Bir SONRAKI bos satir, sayfada HERHANGI bir sutunda veri olan son
+    # satirdan sonra gelir - sadece ID sutununa degil, tum tabloya bakiyoruz.
+    next_row_index = len(grid) + 1
     return max_id + 1, next_row_index
 
 
@@ -1663,10 +1719,11 @@ def set_row_color(service, sheet_name, row_index, color_name):
 
 
 def write_passport_row(service, sheet_name, field_values):
-    headers = get_sheet_headers(service, sheet_name)
+    grid = get_sheet_grid(service, sheet_name)
+    header_row_idx, headers = get_header_row(service, sheet_name, grid)
     if not headers:
         return None
-    next_id, row_index = get_next_id_and_row(service, sheet_name)
+    next_id, row_index = get_next_id_and_row(service, sheet_name, grid)
     row = []
     for h in headers:
         key = match_header_to_field(h)
@@ -1687,25 +1744,63 @@ def write_passport_row(service, sheet_name, field_values):
 
 
 def find_row_by_id(service, sheet_name, target_id):
-    col_a = get_column_a_values(service, sheet_name)
-    for i, row in enumerate(col_a, start=1):
-        if i == 1 or not row:
+    grid = get_sheet_grid(service, sheet_name)
+    header_row_idx, headers = get_header_row(service, sheet_name, grid)
+    id_col = None
+    for i, h in enumerate(headers):
+        if match_header_to_field(h) == "id":
+            id_col = i
+            break
+    if id_col is None:
+        return None, None, None
+    for i, row in enumerate(grid, start=1):
+        if i <= header_row_idx or len(row) <= id_col or not row[id_col]:
             continue
         try:
-            v = int(float(str(row[0]).strip()))
+            v = int(float(str(row[id_col]).strip()))
         except Exception:
             continue
         if v == target_id:
-            headers = get_sheet_headers(service, sheet_name)
-            last_col = colnum_to_letter(len(headers))
-            result = service.spreadsheets().values().get(
-                spreadsheetId=SHEETS_SPREADSHEET_ID,
-                range=f"'{sheet_name}'!A{i}:{last_col}{i}",
-            ).execute()
-            values = result.get("values", [[]])
-            row_values = values[0] if values else []
-            return i, headers, row_values
+            return i, headers, row
     return None, None, None
+
+
+def list_country_records(service, sheet_name, only_pending=True):
+    """
+    'Randevu Aldim' akisinda ID'yi ezbere yazmak zorunda kalmamak icin,
+    ulke sayfasindaki mevcut kayitlari (ID + isim soyisim) listeler.
+    only_pending=True ise zaten randevu alinmis (Islem Sonucu dolu) satirlari
+    listeden cikarir.
+    """
+    grid = get_sheet_grid(service, sheet_name)
+    header_row_idx, headers = get_header_row(service, sheet_name, grid)
+
+    def col_of(field_key):
+        for i, h in enumerate(headers):
+            if match_header_to_field(h) == field_key:
+                return i
+        return None
+
+    id_col = col_of("id")
+    isim_col = col_of("isim")
+    soyisim_col = col_of("soyisim")
+    sonuc_col = col_of("islem_sonucu")
+    if id_col is None:
+        return []
+
+    def cell(row, idx):
+        return row[idx] if idx is not None and idx < len(row) and row[idx] else ""
+
+    records = []
+    for row in grid[header_row_idx:]:
+        rid = cell(row, id_col)
+        if not rid:
+            continue
+        if only_pending and cell(row, sonuc_col):
+            continue
+        isim = f"{cell(row, isim_col)} {cell(row, soyisim_col)}".strip()
+        records.append((rid, isim))
+    return records
 
 
 def copy_to_master(service, headers, row_values, extra_fields):
@@ -1716,10 +1811,11 @@ def copy_to_master(service, headers, row_values, extra_fields):
             data[key] = v
     data.update(extra_fields)
 
-    master_headers = get_sheet_headers(service, MASTER_SHEET_NAME)
+    master_grid = get_sheet_grid(service, MASTER_SHEET_NAME)
+    _, master_headers = get_header_row(service, MASTER_SHEET_NAME, master_grid)
     if not master_headers:
         return
-    _, next_row = get_next_id_and_row(service, MASTER_SHEET_NAME)
+    _, next_row = get_next_id_and_row(service, MASTER_SHEET_NAME, master_grid)
     new_row = []
     for h in master_headers:
         key = match_header_to_field(h)
