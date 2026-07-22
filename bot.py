@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import json
 import html as html_lib
 import base64
@@ -123,7 +124,8 @@ KNOWN_IMAP_HOSTS = {
 }
 
 # Bu saglayicilar artik basit sifre/uygulama sifresiyle IMAP kabul etmiyor,
-# OAuth gerekiyor - bunlar icin Outlook bolumundeki yontem kullanilmali.
+# OAuth gerektiriyor. Bu bot Outlook/Hotmail desteklemiyor (sadece Gmail,
+# Yandex ve benzeri uygulama sifresiyle IMAP'e izin veren saglayicilar).
 OAUTH_ONLY_DOMAINS = {"outlook.com", "hotmail.com", "live.com", "msn.com"}
 
 
@@ -154,8 +156,8 @@ def load_imap_accounts(max_accounts=30):
         if not host:
             logger.error(
                 "IMAP_ADDRESS_%s (%s) icin sunucu belirlenemedi - "
-                "IMAP_HOST_%s ekleyin ya da bu adres Outlook/Hotmail ise "
-                "OAuth yontemini kullanin.", i, addr, i,
+                "IMAP_HOST_%s ekleyin (Outlook/Hotmail bu bot tarafindan "
+                "desteklenmiyor).", i, addr, i,
             )
             continue
         label = os.environ.get(f"IMAP_LABEL_{i}") or addr
@@ -169,26 +171,6 @@ IMAP_ACCOUNTS = load_imap_accounts()
 MAIL_ATTACHMENT_MAX_MB = float(os.environ.get("MAIL_ATTACHMENT_MAX_MB", "20"))
 MAIL_ATTACHMENT_MAX_BYTES = int(MAIL_ATTACHMENT_MAX_MB * 1024 * 1024)
 
-
-def load_outlook_refresh_tokens(max_accounts=30):
-    """
-    OUTLOOK_REFRESH_TOKEN_1, OUTLOOK_REFRESH_TOKEN_2 ... seklinde numaralanmis
-    (her biri ayri bir Microsoft hesabi icin) refresh token'lari okur.
-    Numarasiz OUTLOOK_REFRESH_TOKEN da (tek hesap icin) desteklenir.
-    """
-    tokens = []
-    single = os.environ.get("OUTLOOK_REFRESH_TOKEN")
-    if single:
-        tokens.append(single)
-    for i in range(1, max_accounts + 1):
-        val = os.environ.get(f"OUTLOOK_REFRESH_TOKEN_{i}")
-        if val:
-            tokens.append(val)
-    return tokens
-
-
-OUTLOOK_CLIENT_ID = os.environ.get("OUTLOOK_CLIENT_ID")
-OUTLOOK_REFRESH_TOKENS_ENV = load_outlook_refresh_tokens()
 
 # Bos birakilirsa TUM gelen mailler Telegram'a duser. Doldurulursa (virgulle
 # ayrilmis kelimeler) sadece konu/gonderen/govdede bu kelimelerden birini
@@ -215,6 +197,7 @@ config = db["config"]
 mail_state = db["mail_state"]
 counters = db["counters"]
 team = db["team"]
+sheet_state = db["sheet_state"]
 
 # Buton akisi sirasinda kullanicinin nerede oldugunu tutan bellek ici durum.
 # (Render tek worker ile calistigi surece sorunsuzdur; servis yeniden
@@ -345,6 +328,17 @@ def add_calendar_event(text, dt_local):
 
 def send_email(subject, body):
     if not (EMAILJS_SERVICE_ID and EMAILJS_TEMPLATE_ID and EMAILJS_PUBLIC_KEY and USER_EMAILS):
+        missing = [
+            name for name, val in [
+                ("EMAILJS_SERVICE_ID", EMAILJS_SERVICE_ID),
+                ("EMAILJS_TEMPLATE_ID", EMAILJS_TEMPLATE_ID),
+                ("EMAILJS_PUBLIC_KEY", EMAILJS_PUBLIC_KEY),
+                ("USER_EMAIL", USER_EMAILS),
+            ] if not val
+        ]
+        logger.warning(
+            "E-posta gonderilemedi: su ortam degiskenleri eksik/bos: %s", ", ".join(missing)
+        )
         return
     # USER_EMAIL virgulle birden fazla adres icerebilir - her birine ayri
     # gonderiyoruz (EmailJS'in ucretsiz sablonlari tek aliciya gore kurulu).
@@ -450,6 +444,8 @@ def build_main_menu_keyboard():
         [InlineKeyboardButton("\U0001f6c2 Pasaport Ekle", callback_data="passport_add")],
         [InlineKeyboardButton("✅ Randevu Aldim", callback_data="appt_start")],
         [InlineKeyboardButton("\U0001f4cb Pasaport Kayitlarini Gor", callback_data="passport_list_start")],
+        [InlineKeyboardButton("\U0001f50d Kayit Ara (Isim/ID)", callback_data="search_start")],
+        [InlineKeyboardButton("\U0001f4ca Rapor Al", callback_data="report_start")],
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -858,6 +854,71 @@ def button_router(update: Update, context: CallbackContext):
         replace_ui(query, text, build_main_menu_keyboard())
         return
 
+    # --- Isim/ID ile tum sayfalarda arama ---
+    if data == "search_start":
+        query.answer()
+        service = get_sheets_service()
+        if not service:
+            replace_ui(
+                query,
+                "Google Sheets baglantisi kurulu degil. Lutfen once GOOGLE_SERVICE_ACCOUNT_JSON "
+                "ve SHEETS_SPREADSHEET_ID ayarlarini tamamlayin.",
+                build_main_menu_keyboard(),
+            )
+            return
+        PENDING[chat_id] = {"awaiting_search_query": True}
+        replace_ui(query, "Aranacak ismi (veya ID numarasini) yazip gonderin:")
+        return
+
+    # --- Tarih araligi rapor (Excel) ---
+    if data == "report_start":
+        query.answer()
+        service = get_sheets_service()
+        if not service:
+            replace_ui(
+                query,
+                "Google Sheets baglantisi kurulu degil. Lutfen once GOOGLE_SERVICE_ACCOUNT_JSON "
+                "ve SHEETS_SPREADSHEET_ID ayarlarini tamamlayin.",
+                build_main_menu_keyboard(),
+            )
+            return
+        PENDING[chat_id] = {"awaiting_report_range": True}
+        replace_ui(
+            query,
+            "Rapor icin tarih araligini yazip gonderin\n"
+            "(GG.AA.YYYY-GG.AA.YYYY, orn: 01.07.2026-31.07.2026):",
+        )
+        return
+
+    # --- Mukerrer pasaport onayi ---
+    if data in ("dup_confirm_yes", "dup_confirm_no"):
+        query.answer()
+        pending = PENDING.get(chat_id, {})
+        if not pending.get("awaiting_duplicate_confirm"):
+            return
+        if data == "dup_confirm_no":
+            PENDING.pop(chat_id, None)
+            replace_ui(query, "Kayit iptal edildi.", build_main_menu_keyboard())
+            return
+        service = get_sheets_service()
+        country = pending.get("country_sheet")
+        if not service or not country:
+            PENDING.pop(chat_id, None)
+            replace_ui(query, "Google Sheets baglantisi kurulu degil.", build_main_menu_keyboard())
+            return
+        result = write_passport_row(service, country, pending.get("passport_fields", {}))
+        PENDING.pop(chat_id, None)
+        if result:
+            next_id, _ = result
+            replace_ui(
+                query,
+                f"Kayit '{country}' sayfasina eklendi (ID: {next_id}, bekleme listesi - sari).",
+                build_main_menu_keyboard(),
+            )
+        else:
+            replace_ui(query, "Kayit eklenemedi, sayfa basliklari okunamadi.", build_main_menu_keyboard())
+        return
+
     query.answer()
 
 
@@ -947,6 +1008,26 @@ def handle_text_input(update: Update, context: CallbackContext):
             update.message.reply_text("Google Sheets baglantisi kurulu degil.", reply_markup=build_main_menu_keyboard())
             PENDING.pop(chat_id, None)
             return
+
+        # Mukerrer pasaport kontrolu: ayni pasaport numarasi baska bir
+        # kayitta (herhangi bir ulke sayfasinda) varsa, eklemeden once
+        # kullaniciya sorulur.
+        pasaport_no = pending["passport_fields"].get("pasaport_no", "")
+        dup = find_passport_duplicate(service, pasaport_no) if pasaport_no else None
+        if dup:
+            dup_country, dup_id = dup
+            pending["awaiting_passport_manual"] = False
+            pending["awaiting_duplicate_confirm"] = True
+            update.message.reply_text(
+                f"⚠️ Bu pasaport numarasi zaten '{dup_country}' sayfasinda ID #{dup_id} ile kayitli. "
+                f"Yine de yeni bir kayit eklemek istiyor musunuz?",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Evet, yine de ekle", callback_data="dup_confirm_yes")],
+                    [InlineKeyboardButton("Iptal", callback_data="dup_confirm_no")],
+                ]),
+            )
+            return
+
         result = write_passport_row(service, country, pending["passport_fields"])
         PENDING.pop(chat_id, None)
         if result:
@@ -959,6 +1040,63 @@ def handle_text_input(update: Update, context: CallbackContext):
             update.message.reply_text(
                 "Kayit eklenemedi, sayfa basliklari okunamadi.", reply_markup=build_main_menu_keyboard()
             )
+        return
+
+    if pending and pending.get("awaiting_search_query"):
+        PENDING.pop(chat_id, None)
+        service = get_sheets_service()
+        if not service:
+            update.message.reply_text("Google Sheets baglantisi kurulu degil.", reply_markup=build_main_menu_keyboard())
+            return
+        results = search_records(service, raw_text)
+        if not results:
+            update.message.reply_text(
+                f"'{raw_text}' icin sonuc bulunamadi.", reply_markup=build_main_menu_keyboard()
+            )
+            return
+        lines = [f"'{raw_text}' icin {len(results)} sonuc bulundu:", ""]
+        for country, rid, isim, sonuc in results[:30]:
+            durum = "✅ " + sonuc if sonuc else "🟡 Beklemede"
+            lines.append(f"#{rid} - {isim or '(isimsiz)'} - {country} - {durum}")
+        update.message.reply_text("\n".join(lines), reply_markup=build_main_menu_keyboard())
+        return
+
+    if pending and pending.get("awaiting_report_range"):
+        m = re.match(
+            r"^\s*(\d{2})\.(\d{2})\.(\d{4})\s*-\s*(\d{2})\.(\d{2})\.(\d{4})\s*$", raw_text
+        )
+        if not m:
+            update.message.reply_text(
+                "Format hatali. GG.AA.YYYY-GG.AA.YYYY seklinde yazin, orn: 01.07.2026-31.07.2026"
+            )
+            return
+        try:
+            start_date = date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+            end_date = date(int(m.group(6)), int(m.group(5)), int(m.group(4)))
+        except ValueError:
+            update.message.reply_text("Gecersiz tarih. Lutfen tekrar deneyin.")
+            return
+        PENDING.pop(chat_id, None)
+        if end_date < start_date:
+            update.message.reply_text(
+                "Bitis tarihi baslangictan once olamaz.", reply_markup=build_main_menu_keyboard()
+            )
+            return
+        service = get_sheets_service()
+        if not service:
+            update.message.reply_text("Google Sheets baglantisi kurulu degil.", reply_markup=build_main_menu_keyboard())
+            return
+        update.message.reply_text("Rapor hazirlaniyor, birkac saniye surebilir...")
+        bio = generate_appointment_report(service, start_date, end_date)
+        if bio is None:
+            update.message.reply_text(
+                "Bu tarih araliginda kayit bulunamadi (ya da openpyxl kurulu degil).",
+                reply_markup=build_main_menu_keyboard(),
+            )
+            return
+        fname = f"rapor_{start_date.strftime('%d.%m.%Y')}_{end_date.strftime('%d.%m.%Y')}.xlsx"
+        update.message.reply_document(document=bio, filename=fname)
+        update.message.reply_text("Ana Menu:", reply_markup=build_main_menu_keyboard())
         return
 
     if pending and pending.get("awaiting_appt_id"):
@@ -1243,7 +1381,7 @@ def check_due_reminders():
 
 
 # ---------------------------------------------------------------------------
-# Mail izleme: Gmail / Yandex (IMAP) ve Outlook (Microsoft Graph / OAuth)
+# Mail izleme: Gmail / Yandex ve uygulama sifresiyle IMAP destekleyen diger saglayicilar
 # ---------------------------------------------------------------------------
 def decode_mime_words(s):
     if not s:
@@ -1418,7 +1556,10 @@ def poll_imap_account(account_key, host, user, password, label):
     if not (user and password):
         return
     try:
-        imap = imaplib.IMAP4_SSL(host, 993)
+        # timeout onemli: yavas/yanit vermeyen tek bir hesap butun
+        # check_new_mail turunu kilitleyip diger hesaplarin da gecikmesine
+        # yol acmasin diye.
+        imap = imaplib.IMAP4_SSL(host, 993, timeout=10)
         try:
             imap.login(user, password)
             imap.select("INBOX")
@@ -1459,130 +1600,9 @@ def poll_imap_account(account_key, host, user, password, label):
         logger.error("%s IMAP hatasi: %s", label, e)
 
 
-def get_outlook_refresh_token_value(idx, env_value):
-    doc = mail_state.find_one({"_id": f"outlook_token_{idx}"})
-    if doc and doc.get("refresh_token"):
-        return doc["refresh_token"]
-    return env_value
-
-
-def get_outlook_access_token(idx, env_value):
-    refresh_token = get_outlook_refresh_token_value(idx, env_value)
-    if not (OUTLOOK_CLIENT_ID and refresh_token):
-        return None
-    try:
-        r = requests.post(
-            "https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
-            data={
-                "client_id": OUTLOOK_CLIENT_ID,
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-                "scope": "https://graph.microsoft.com/Mail.Read offline_access",
-            },
-            timeout=15,
-        )
-        data = r.json()
-        if "access_token" not in data:
-            logger.error("Outlook #%s token yenilenemedi: %s", idx, data)
-            return None
-        new_refresh = data.get("refresh_token")
-        if new_refresh:
-            mail_state.update_one(
-                {"_id": f"outlook_token_{idx}"}, {"$set": {"refresh_token": new_refresh}}, upsert=True
-            )
-        return data["access_token"]
-    except Exception as e:
-        logger.error("Outlook #%s token istegi basarisiz: %s", idx, e)
-        return None
-
-
-def fetch_outlook_attachments(token, message_id):
-    attachments = []
-    try:
-        r = requests.get(
-            f"https://graph.microsoft.com/v1.0/me/messages/{message_id}/attachments",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=20,
-        )
-        if r.status_code != 200:
-            logger.error("Outlook ek dosyalari alinamadi: %s %s", r.status_code, r.text)
-            return attachments
-        for item in r.json().get("value", []):
-            content_bytes = item.get("contentBytes")
-            if not content_bytes:
-                continue
-            try:
-                data = base64.b64decode(content_bytes)
-            except Exception:
-                continue
-            attachments.append({
-                "filename": item.get("name") or "dosya",
-                "data": data,
-                "content_type": item.get("contentType") or "application/octet-stream",
-            })
-    except Exception as e:
-        logger.error("Outlook ek dosyalari istegi basarisiz: %s", e)
-    return attachments
-
-
-def poll_outlook_account(idx, env_value):
-    token = get_outlook_access_token(idx, env_value)
-    if not token:
-        return
-
-    doc = mail_state.find_one({"_id": f"outlook_{idx}"})
-    last_check = None
-    if doc and doc.get("last_check"):
-        last_check = doc["last_check"].replace(tzinfo=UTC)
-
-    try:
-        r = requests.get(
-            "https://graph.microsoft.com/v1.0/me/messages",
-            headers={"Authorization": f"Bearer {token}"},
-            params={
-                "$orderby": "receivedDateTime desc",
-                "$top": "15",
-                "$select": "id,subject,from,receivedDateTime,bodyPreview,hasAttachments",
-            },
-            timeout=15,
-        )
-        if r.status_code != 200:
-            logger.error("Graph API hatasi (Outlook #%s): %s %s", idx, r.status_code, r.text)
-            return
-        messages = r.json().get("value", [])
-    except Exception as e:
-        logger.error("Outlook #%s mesajlari alinamadi: %s", idx, e)
-        return
-
-    newest_seen = last_check
-    for m in reversed(messages):
-        try:
-            received = datetime.fromisoformat(m["receivedDateTime"].replace("Z", "+00:00"))
-        except Exception:
-            continue
-        if last_check and received <= last_check:
-            continue
-        sender = ""
-        try:
-            sender = m.get("from", {}).get("emailAddress", {}).get("address", "")
-        except Exception:
-            pass
-        attachments = fetch_outlook_attachments(token, m["id"]) if m.get("hasAttachments") else []
-        notify_new_mail(f"Outlook #{idx}", sender, m.get("subject", ""), m.get("bodyPreview", ""), attachments)
-        if not newest_seen or received > newest_seen:
-            newest_seen = received
-
-    if newest_seen:
-        mail_state.update_one(
-            {"_id": f"outlook_{idx}"}, {"$set": {"last_check": newest_seen}}, upsert=True
-        )
-
-
 def check_new_mail():
     for acc in IMAP_ACCOUNTS:
         poll_imap_account(acc["key"], acc["host"], acc["address"], acc["password"], acc["label"])
-    for idx, token_env in enumerate(OUTLOOK_REFRESH_TOKENS_ENV, start=1):
-        poll_outlook_account(idx, token_env)
 
 
 # =============================================================================
@@ -1800,6 +1820,10 @@ def write_passport_row(service, sheet_name, field_values):
         body={"values": [row]},
     ).execute()
     set_row_color(service, sheet_name, row_index, "yellow")
+    # Bot kendi ekledigi satiri "gorulmus" olarak isaretler, boylece asagidaki
+    # periyodik pasaport-satiri tarama isi bu satiri TEKRAR bildirim olarak
+    # gondermez (bot zaten kullaniciya kayit eklendi mesaji gosteriyor).
+    set_seen_row_count(sheet_name, row_index)
     return next_id, row_index
 
 
@@ -1823,6 +1847,69 @@ def find_row_by_id(service, sheet_name, target_id):
         if v == target_id:
             return i, headers, row
     return None, None, None
+
+
+def get_seen_row_count(sheet_name):
+    doc = sheet_state.find_one({"_id": sheet_name})
+    return doc.get("row_count", 0) if doc else 0
+
+
+def set_seen_row_count(sheet_name, count):
+    sheet_state.update_one({"_id": sheet_name}, {"$set": {"row_count": count}}, upsert=True)
+
+
+def check_new_passport_rows():
+    """
+    Google Sheets'e (bot uzerinden ya da elle) yeni bir pasaport satiri
+    eklenip eklenmedigini periyodik olarak kontrol eder, yeni satirlar icin
+    Telegram bildirimi gonderir. Botun kendi ekledigi satirlar write_passport_row
+    icinde zaten "gorulmus" olarak isaretlendigi icin burada tekrar bildirilmez.
+    """
+    service = get_sheets_service()
+    if not service:
+        return
+    try:
+        countries = list_country_sheets(service)
+    except Exception as e:
+        logger.error("Ulke sayfalari listelenemedi: %s", e)
+        return
+
+    for country in countries:
+        try:
+            grid = get_sheet_grid(service, country)
+            header_row_idx, headers = get_header_row(service, country, grid)
+            current_count = len(grid)
+            seen_count = get_seen_row_count(country)
+
+            if seen_count == 0:
+                # Bu sayfa icin ilk calisma - mevcut durumu baz alip
+                # gecmis kayitlar icin bildirim gondermiyoruz.
+                set_seen_row_count(country, current_count)
+                continue
+
+            if current_count <= seen_count:
+                continue
+
+            id_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "id"), None)
+            isim_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "isim"), None)
+            soyisim_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "soyisim"), None)
+
+            def cell(row, idx):
+                return row[idx] if idx is not None and idx < len(row) and row[idx] else ""
+
+            for row in grid[seen_count:current_count]:
+                rid = cell(row, id_col)
+                if not rid:
+                    continue
+                isim = f"{cell(row, isim_col)} {cell(row, soyisim_col)}".strip()
+                text = f"\U0001f195 Yeni pasaport kaydi: '{country}' sayfasi - #{rid}"
+                if isim:
+                    text += f" - {isim}"
+                broadcast_message(text)
+
+            set_seen_row_count(country, current_count)
+        except Exception as e:
+            logger.error("'%s' sayfasi pasaport taramasi basarisiz: %s", country, e)
 
 
 def list_country_records(service, sheet_name, only_pending=True):
@@ -1862,6 +1949,234 @@ def list_country_records(service, sheet_name, only_pending=True):
         isim = f"{cell(row, isim_col)} {cell(row, soyisim_col)}".strip()
         records.append((rid, isim, sonuc))
     return records
+
+
+def search_records(service, query_text):
+    """
+    Isim (soyisim dahil) veya ID numarasina gore TUM ulke sayfalarinda arama
+    yapar. Sonuc: (ulke, id, isim_soyisim, islem_sonucu) tuple listesi.
+    """
+    q = (query_text or "").strip().lower()
+    q_id = None
+    try:
+        q_id = int(float(q))
+    except (ValueError, TypeError):
+        pass
+
+    results = []
+    for country in list_country_sheets(service):
+        try:
+            grid = get_sheet_grid(service, country)
+            header_row_idx, headers = get_header_row(service, country, grid)
+        except Exception as e:
+            logger.error("'%s' sayfasi okunamadi (arama): %s", country, e)
+            continue
+
+        id_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "id"), None)
+        isim_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "isim"), None)
+        soyisim_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "soyisim"), None)
+        sonuc_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "islem_sonucu"), None)
+        if id_col is None:
+            continue
+
+        def cell(row, idx):
+            return row[idx] if idx is not None and idx < len(row) and row[idx] else ""
+
+        for row in grid[header_row_idx:]:
+            rid = cell(row, id_col)
+            if not rid:
+                continue
+            isim_full = f"{cell(row, isim_col)} {cell(row, soyisim_col)}".strip()
+            match = False
+            if q_id is not None:
+                try:
+                    if int(float(str(rid).strip())) == q_id:
+                        match = True
+                except Exception:
+                    pass
+            if not match and q and q in isim_full.lower():
+                match = True
+            if match:
+                results.append((country, rid, isim_full, cell(row, sonuc_col)))
+    return results
+
+
+def find_passport_duplicate(service, pasaport_no):
+    """
+    Girilen pasaport numarasi HERHANGI bir ulke sayfasinda zaten kayitli mi
+    diye kontrol eder. Bulursa (ulke, id) dondurur, bulamazsa None.
+    """
+    target = re.sub(r"[^A-Z0-9]", "", (pasaport_no or "").upper())
+    if not target:
+        return None
+    for country in list_country_sheets(service):
+        try:
+            grid = get_sheet_grid(service, country)
+            header_row_idx, headers = get_header_row(service, country, grid)
+        except Exception as e:
+            logger.error("'%s' sayfasi okunamadi (mukerrer kontrol): %s", country, e)
+            continue
+
+        pn_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "pasaport_no"), None)
+        id_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "id"), None)
+        if pn_col is None:
+            continue
+        for row in grid[header_row_idx:]:
+            if len(row) <= pn_col or not row[pn_col]:
+                continue
+            val = re.sub(r"[^A-Z0-9]", "", str(row[pn_col]).upper())
+            if val == target:
+                rid = row[id_col] if id_col is not None and id_col < len(row) else "?"
+                return country, rid
+    return None
+
+
+def generate_appointment_report(service, start_date, end_date):
+    """
+    start_date/end_date (date nesneleri) araligindaki randevu gunune sahip
+    kayitlari TUM ulke sayfalarindan toplayip bir Excel workbook'u (BytesIO)
+    olarak dondurur. Hic kayit yoksa None dondurur.
+    """
+    try:
+        from openpyxl import Workbook
+    except ImportError:
+        return None
+
+    rows_out = []
+    for country in list_country_sheets(service):
+        try:
+            grid = get_sheet_grid(service, country)
+            header_row_idx, headers = get_header_row(service, country, grid)
+        except Exception as e:
+            logger.error("'%s' sayfasi okunamadi (rapor): %s", country, e)
+            continue
+
+        id_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "id"), None)
+        isim_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "isim"), None)
+        soyisim_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "soyisim"), None)
+        vize_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "vize_turu"), None)
+        gun_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "randevu_gunu"), None)
+        saat_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "saat"), None)
+        referans_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "referans"), None)
+        sonuc_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "islem_sonucu"), None)
+        if id_col is None or gun_col is None:
+            continue
+
+        def cell(row, idx):
+            return row[idx] if idx is not None and idx < len(row) and row[idx] else ""
+
+        for row in grid[header_row_idx:]:
+            rid = cell(row, id_col)
+            gun = cell(row, gun_col)
+            if not rid or not gun:
+                continue
+            try:
+                d = datetime.strptime(gun, "%d.%m.%Y").date()
+            except Exception:
+                continue
+            if not (start_date <= d <= end_date):
+                continue
+            rows_out.append((d, [
+                country, rid,
+                cell(row, isim_col), cell(row, soyisim_col),
+                cell(row, vize_col), gun, cell(row, saat_col),
+                cell(row, referans_col), cell(row, sonuc_col),
+            ]))
+
+    if not rows_out:
+        return None
+
+    rows_out.sort(key=lambda item: item[0])
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Randevu Raporu"
+    ws.append(["Ulke", "ID", "Isim", "Soyisim", "Vize Turu", "Randevu Gunu", "Saat", "Referans", "Islem Sonucu"])
+    for _d, row_data in rows_out:
+        ws.append(row_data)
+
+    bio = BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    return bio
+
+
+PASSPORT_EXPIRY_WARN_DAYS = int(os.environ.get("PASSPORT_EXPIRY_WARN_DAYS", "180"))
+
+
+def send_daily_digest():
+    """
+    Her sabah (DAILY_DIGEST_HOUR:DAILY_DIGEST_MINUTE, Turkiye saati) calisir:
+    bugunku randevu sayisi, bekleyen kayit sayisi ve suresi yakinda dolacak
+    pasaportlari ozetleyen bir Telegram mesaji gonderir.
+    """
+    service = get_sheets_service()
+    if not service:
+        return
+    today = datetime.now(TZ).date()
+    total_appt_today = 0
+    total_pending = 0
+    expiring_soon = []
+
+    for country in list_country_sheets(service):
+        try:
+            grid = get_sheet_grid(service, country)
+            header_row_idx, headers = get_header_row(service, country, grid)
+        except Exception as e:
+            logger.error("'%s' sayfasi okunamadi (gunluk ozet): %s", country, e)
+            continue
+
+        id_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "id"), None)
+        isim_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "isim"), None)
+        soyisim_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "soyisim"), None)
+        sonuc_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "islem_sonucu"), None)
+        gun_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "randevu_gunu"), None)
+        skt_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "pasaport_skt"), None)
+        if id_col is None:
+            continue
+
+        def cell(row, idx):
+            return row[idx] if idx is not None and idx < len(row) and row[idx] else ""
+
+        for row in grid[header_row_idx:]:
+            rid = cell(row, id_col)
+            if not rid:
+                continue
+            sonuc = cell(row, sonuc_col)
+            if not sonuc:
+                total_pending += 1
+            gun = cell(row, gun_col)
+            if gun:
+                try:
+                    d = datetime.strptime(gun, "%d.%m.%Y").date()
+                    if d == today:
+                        total_appt_today += 1
+                except Exception:
+                    pass
+            skt = cell(row, skt_col)
+            if skt:
+                try:
+                    d2 = datetime.strptime(skt, "%d.%m.%Y").date()
+                    days_left = (d2 - today).days
+                    if 0 <= days_left <= PASSPORT_EXPIRY_WARN_DAYS:
+                        isim = f"{cell(row, isim_col)} {cell(row, soyisim_col)}".strip()
+                        expiring_soon.append((country, rid, isim, skt, days_left))
+                except Exception:
+                    pass
+
+    lines = [
+        f"\U0001f4c5 Gunluk Ozet ({today.strftime('%d.%m.%Y')})",
+        "",
+        f"Bugun randevusu olan: {total_appt_today}",
+        f"Bekleyen (randevu alinmamis) kayit: {total_pending}",
+    ]
+    if expiring_soon:
+        expiring_soon.sort(key=lambda x: x[4])
+        lines.append("")
+        lines.append(f"⚠️ Pasaport suresi yakinda dolacaklar ({len(expiring_soon)}):")
+        for country, rid, isim, skt, days_left in expiring_soon[:20]:
+            lines.append(f"#{rid} - {isim or '(isimsiz)'} - {country} - SKT: {skt} ({days_left} gun)")
+    broadcast_message("\n".join(lines))
 
 
 def copy_to_master(service, headers, row_values, extra_fields):
@@ -2005,10 +2320,23 @@ def parse_mrz(lines):
 
 
 REMINDER_CHECK_INTERVAL_SECONDS = int(os.environ.get("REMINDER_CHECK_INTERVAL_SECONDS", "20"))
+# Pasaport eklemeleri hatirlatici/mail kadar saniye hassasiyeti gerektirmedigi
+# icin varsayilan biraz daha gevsek - Sheets API'ye gereksiz yuk binmesin.
+PASSPORT_CHECK_INTERVAL_SECONDS = int(os.environ.get("PASSPORT_CHECK_INTERVAL_SECONDS", "60"))
+# Gunluk ozet bildiriminin gonderilecegi saat/dakika (Turkiye saati).
+DAILY_DIGEST_HOUR = int(os.environ.get("DAILY_DIGEST_HOUR", "9"))
+DAILY_DIGEST_MINUTE = int(os.environ.get("DAILY_DIGEST_MINUTE", "0"))
 
 scheduler = BackgroundScheduler(timezone="UTC")
 scheduler.add_job(check_due_reminders, "interval", seconds=REMINDER_CHECK_INTERVAL_SECONDS, max_instances=1)
 scheduler.add_job(check_new_mail, "interval", seconds=MAIL_CHECK_INTERVAL_SECONDS, max_instances=1)
+if GOOGLE_LIBS_AVAILABLE:
+    scheduler.add_job(check_new_passport_rows, "interval", seconds=PASSPORT_CHECK_INTERVAL_SECONDS, max_instances=1)
+    scheduler.add_job(
+        send_daily_digest, "cron",
+        hour=DAILY_DIGEST_HOUR, minute=DAILY_DIGEST_MINUTE, timezone=TZ,
+        max_instances=1,
+    )
 scheduler.start()
 
 
