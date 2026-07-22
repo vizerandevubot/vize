@@ -1103,6 +1103,26 @@ dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_te
 dispatcher.add_handler(MessageHandler(Filters.photo, handle_photo_message))
 
 
+def handle_dispatcher_error(update, context):
+    """
+    Herhangi bir buton/mesaj isleyicisinde beklenmeyen bir hata olursa,
+    kullanici sessiz kalmis bir bot yerine (eskiden oldugu gibi) en azindan
+    bir hata mesaji gorsun ve Render loglarina tam traceback dussun.
+    """
+    logger.error("Beklenmeyen hata: %s", context.error, exc_info=context.error)
+    try:
+        if isinstance(update, Update) and update.effective_chat:
+            context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Bir seyler ters gitti, tekrar dener misiniz? Sorun devam ederse Render loglarina bakilmasi gerekebilir.",
+            )
+    except Exception:
+        pass
+
+
+dispatcher.add_error_handler(handle_dispatcher_error)
+
+
 # ---------------------------------------------------------------------------
 # Flask uc noktalari
 # ---------------------------------------------------------------------------
@@ -1806,14 +1826,23 @@ def parse_mrz(lines):
         logger.error("MRZ ayristirma hatasi: %s", e)
         return None, False
 
+    # onemli: checker.fields() bir sozluk DEGIL, ozellikleri nokta ile
+    # okunan bir nesne dondurur (raw.name, raw.surname gibi) - .get() yok.
+    def g(*names):
+        for n in names:
+            v = getattr(raw, n, None)
+            if v:
+                return v
+        return ""
+
     fields = {
-        "isim": (raw.get("name") or "").replace("<", " ").strip(),
-        "soyisim": (raw.get("surname") or "").replace("<", " ").strip(),
-        "pasaport_no": (raw.get("document_number") or "").replace("<", "").strip(),
-        "dogum_tarihi": mrz_date_to_ddmmyyyy(raw.get("birth_date") or "", is_expiry=False),
-        "pasaport_skt": mrz_date_to_ddmmyyyy(raw.get("expiry_date") or "", is_expiry=True),
-        "uyruk": (raw.get("nationality") or "").strip(),
-        "kimlik_no": (raw.get("personal_number") or "").replace("<", "").strip(),
+        "isim": g("name").replace("<", " ").strip(),
+        "soyisim": g("surname").replace("<", " ").strip(),
+        "pasaport_no": g("document_number").replace("<", "").strip(),
+        "dogum_tarihi": mrz_date_to_ddmmyyyy(g("birth_date"), is_expiry=False),
+        "pasaport_skt": mrz_date_to_ddmmyyyy(g("expiry_date"), is_expiry=True),
+        "uyruk": g("nationality").strip(),
+        "kimlik_no": g("personal_number", "optional_data", "optional_data_2").replace("<", "").strip(),
     }
     return fields, valid
 
