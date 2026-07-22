@@ -2335,9 +2335,14 @@ scheduler.add_job(check_due_reminders, "interval", seconds=REMINDER_CHECK_INTERV
 scheduler.add_job(check_new_mail, "interval", seconds=MAIL_CHECK_INTERVAL_SECONDS, max_instances=1)
 if GOOGLE_LIBS_AVAILABLE:
     scheduler.add_job(check_new_passport_rows, "interval", seconds=PASSPORT_CHECK_INTERVAL_SECONDS, max_instances=1)
+    # Scheduler'in kendisi UTC calisiyor; kullanilan APScheduler surumu
+    # zoneinfo nesnelerini (TZ) cron trigger'da kabul etmiyor (sadece pytz
+    # destekliyor), bu yuzden Turkiye saatini (sabit UTC+3, 2016'dan beri
+    # yaz/kis saati uygulamiyor) burada elle UTC'ye ceviriyoruz.
+    _digest_utc_hour = (DAILY_DIGEST_HOUR - 3) % 24
     scheduler.add_job(
         send_daily_digest, "cron",
-        hour=DAILY_DIGEST_HOUR, minute=DAILY_DIGEST_MINUTE, timezone=TZ,
+        hour=_digest_utc_hour, minute=DAILY_DIGEST_MINUTE,
         max_instances=1,
     )
 scheduler.start()
