@@ -2,7 +2,7 @@
 
 Bu bot tamamen **buton** ile çalışır. Telegram'da botunuzu ilk açtığınızda Telegram kendiliğinden bir "Start" düğmesi gösterir (bunu siz yazmazsınız, Telegram'ın standart arayüz elemanıdır) — ona bir kez dokunduktan sonra her şey buton: hatırlatıcı eklemek için tarih takvimden, saat ve dakika listeden seçilir; hatırlatıcı silmek için listeden ilgili butona dokunulur. Tek yazacağınız şey, hatırlatıcının kısa açıklaması (örn. "Vize randevusu"), çünkü bunu butonla seçmenin bir anlamı yok.
 
-Bot ayrıca Gmail, Yandex Mail ve Outlook/Hotmail hesaplarınızı arka planda izler, yeni gelen (isterseniz sadece vize ile ilgili anahtar kelimeleri içeren) e-postaları doğrudan Telegram'a düşürür.
+Bot ayrıca Gmail, Yandex Mail gibi hesaplarınızı arka planda izler, yeni gelen (isterseniz sadece vize ile ilgili anahtar kelimeleri içeren) e-postaları doğrudan Telegram'a düşürür. (Outlook/Hotmail desteklenmiyor — Microsoft'un OAuth zorunluluğu nedeniyle kaldırıldı.)
 
 ## Neye ihtiyacınız var
 
@@ -53,13 +53,13 @@ Bu, hatırlatıcı zamanı geldiğinde size **e-posta gönderilmesi** içindir (
 
 [emailjs.com](https://www.emailjs.com) üzerinden ücretsiz kayıt olun. "Email Services" > Gmail bağlayın. "Email Templates" içine `{{subject}}`, `{{message}}`, alıcı olarak `{{to_email}}` koyun. "Account" sekmesinden Public/Private Key alın. Render'a `EMAILJS_SERVICE_ID`, `EMAILJS_TEMPLATE_ID`, `EMAILJS_PUBLIC_KEY`, `EMAILJS_PRIVATE_KEY`, `USER_EMAIL` olarak ekleyin.
 
-## 8. Gelen Kutusu İzleme (Gmail, Yandex, Outlook)
+## 8. Gelen Kutusu İzleme (Gmail, Yandex ve benzerleri)
 
-Bunlar, o hesaplara gelen yeni mailleri otomatik olarak Telegram'a düşürür. Her sağlayıcı için ayrı kurulum var, istediğinizi/istediklerinizi ekleyin, hiçbiri zorunlu değil.
+Bunlar, o hesaplara gelen yeni mailleri otomatik olarak Telegram'a düşürür. Her hesap için Render'a iki satır eklemeniz yeterli, hiçbiri zorunlu değil.
 
 **Herhangi bir sayıda hesap ekleyebilirsiniz** (Gmail, Yandex, Yahoo, iCloud, Zoho, GMX, Mail.ru, hatta özel/kurumsal bir mail sunucusu) — hepsi tek bir sistemle çalışır: `IMAP_ADDRESS_1`/`IMAP_APP_PASSWORD_1`, `IMAP_ADDRESS_2`/`IMAP_APP_PASSWORD_2`, `IMAP_ADDRESS_3`/`IMAP_APP_PASSWORD_3` şeklinde numarayı artırarak devam edin (30'a kadar). Bot, adresin `@`'dan sonraki kısmına bakarak hangi sunucuyu kullanacağını **otomatik anlıyor** — Gmail için `imap.gmail.com` yazmanıza gerek yok, sadece adresi ve şifreyi giriyorsunuz. Bilmediği özel bir domain olursa (şirket maili gibi) `IMAP_HOST_5` gibi elle sunucu adresi de girebilirsiniz. Yeni bir hesap eklemek istediğinizde tek yapmanız gereken bir sonraki boş numarayla iki satır eklemek — kod değişikliği gerekmez.
 
-Sadece **Outlook/Hotmail/Live** farklı çalışıyor (aşağıdaki ayrı bölüme bakın), çünkü Microsoft o adresler için basit şifreyi tamamen kapattı.
+Not: **Outlook/Hotmail desteklenmiyor** — Microsoft kişisel hesaplar için basit şifreyle IMAP erişimini tamamen kapatıp karmaşık bir OAuth süreci zorunlu kıldığı için bu bottan çıkarıldı.
 
 **Mail eklerinin gönderilmesi**: Bir mailde resim (örn. Fransa vizesinde gelen OTP kodu resmi) veya PDF/Word gibi bir dosya varsa, bot bunu otomatik olarak indirip Telegram'a da gönderir — ayrıca bir ayar yapmanıza gerek yok. Çok büyük dosyalar (varsayılan 20 MB üzeri) gönderilmez, bunu `MAIL_ATTACHMENT_MAX_MB` ile değiştirebilirsiniz.
 
@@ -67,27 +67,13 @@ Sadece **Outlook/Hotmail/Live** farklı çalışıyor (aşağıdaki ayrı bölü
 
 Her hesapta 2 adımlı doğrulamayı açıp bir "uygulama şifresi" (app password) oluşturmanız gerekiyor — yeri sağlayıcıya göre değişir:
 - **Gmail**: [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords)
-- **Yandex**: Ayarlar > Tüm Ayarlar > Posta İstemcileri'nden IMAP'i açın, sonra [passport.yandex.com](https://passport.yandex.com) > Hesap Yönetimi > Şifreler ve Yetkilendirme > Uygulama Şifreleri
+- **Yandex**: Ayarlar > Tüm Ayarlar > Posta İstemcileri'nden IMAP'i açın ve "Uygulama şifreleri ve OAuth token'larına izin ver"i etkinleştirin, sonra [passport.yandex.com](https://passport.yandex.com) > Hesap Yönetimi > Şifreler ve Yetkilendirme > Uygulama Şifreleri
 - **Yahoo**: [account.yahoo.com/security](https://login.yahoo.com/account/security) > "Generate app password"
 - **iCloud**: [appleid.apple.com](https://appleid.apple.com) > Sign-In and Security > App-Specific Passwords
 - **Zoho**: Zoho Mail Ayarlar > Security > App Passwords
 - **GMX / Mail.ru**: hesap güvenlik ayarlarında benzer bir "uygulama şifresi" seçeneği arayın
 
 Aldığınız her adres/şifre çiftini Render'a `IMAP_ADDRESS_N` / `IMAP_APP_PASSWORD_N` olarak, numarayı artırarak ekleyin.
-
-### Outlook / Hotmail
-
-Önemli: Microsoft, kişisel Outlook/Hotmail hesapları için eski usul "uygulama şifresi ile IMAP" erişimini 2026'da tamamen kapattı. Bu yüzden Outlook için farklı bir yol (OAuth) gerekiyor — biraz daha uzun ama tek seferlik. **Aynı Azure uygulamasını (aynı CLIENT_ID) tüm Outlook hesaplarınız için kullanabilirsiniz, sadece her hesap için ayrı bir REFRESH_TOKEN almanız gerekiyor.**
-
-1. [portal.azure.com](https://portal.azure.com) adresine kendi Microsoft hesabınızla girin (ücretsiz, kredi kartı istemez).
-2. "Microsoft Entra ID" > "App registrations" > "New registration". İsim verin (örn. "Is Ajandasi Botu"). "Supported account types" için **"Personal Microsoft accounts only"** seçin. Redirect URI'yi boş bırakabilirsiniz.
-3. Oluşan uygulamanın "Overview" sayfasından **Application (client) ID**'yi kopyalayın.
-4. Sol menüden "Authentication" > aşağı inip **"Allow public client flows"** seçeneğini **Yes** yapın, kaydedin.
-5. Sol menüden "API permissions" ile devam etmenize gerek yok; ama "OAuth consent screen" bir "Test users" listesi isterse (bazı kurulumlarda sormaz), izlemek istediğiniz **her** Outlook/Hotmail adresini o listeye ekleyin — eklemezseniz o hesapla giriş yaparken "erişim reddedildi" hatası alırsınız.
-6. Kendi bilgisayarınızda: `pip install msal`, sonra bu klasördeki `get_outlook_refresh_token.py` dosyasını açıp içindeki `CLIENT_ID` değerini adım 3'teki ID ile değiştirin.
-7. `python get_outlook_refresh_token.py` çalıştırın. Ekranda bir internet adresi ve kod göreceksiniz (`microsoft.com/devicelogin`); tarayıcıda o adrese gidip kodu girin, **1. Outlook hesabınızla** giriş yapıp izin verin.
-8. Terminalde çıkan `OUTLOOK_CLIENT_ID` ve `OUTLOOK_REFRESH_TOKEN` değerlerini Render'a `OUTLOOK_CLIENT_ID` ve `OUTLOOK_REFRESH_TOKEN_1` olarak ekleyin.
-9. **2. Outlook hesabınız için**: `python get_outlook_refresh_token.py`'i tekrar çalıştırın, bu sefer tarayıcıda **2. hesabınızla** giriş yapın. Çıkan yeni refresh token'ı Render'a `OUTLOOK_REFRESH_TOKEN_2` olarak ekleyin (`OUTLOOK_CLIENT_ID` aynı kalır, tekrar eklemenize gerek yok).
 
 ### Bildirimleri Vize ile Sınırlama (Opsiyonel)
 
@@ -145,6 +131,8 @@ Bu özellik, pasaport fotoğrafından bilgileri otomatik okuyup doğru ülke say
 2. Bot sırayla referans numarası, randevu günü (GG.AA.YYYY) ve saatini (SS:DD) soracak.
 3. Girdikten sonra ilgili satır **kırmızıya** boyanır, otomatik olarak `RANDEVU ALINMIŞLAR` (master) sayfasına kopyalanır ve girdiğiniz randevu günü/saati için **otomatik bir hatırlatıcı** (Telegram + takvim) oluşturulur — ayrıca elle hatırlatıcı eklemenize gerek kalmaz.
 
+**Otomatik yeni kayıt bildirimi**: Google Sheets'e (bot üzerinden ya da elle, doğrudan tabloya girilerek) yeni bir pasaport satırı eklendiğinde bot bunu periyodik olarak (varsayılan 60 saniyede bir, `PASSPORT_CHECK_INTERVAL_SECONDS` ile ayarlanabilir) fark edip Telegram'a "Yeni pasaport kaydı" bildirimi gönderir — böylece biri tabloya elle bir satır eklese bile haberdar olursunuz. Botun kendi eklediği kayıtlar için ayrıca bu bildirim gelmez (zaten anlık onay mesajı gösteriliyor).
+
 Not: Pasaport numarası, kimlik no ve mail şifresi gibi hassas bilgiler düz metin olarak Google Sheets'e yazılıyor — tabloya kimlerin erişebildiğini kontrol etmenizi öneririm.
 
 ## 13. Arkadaşınızın/Ekibinizin de Bota Erişmesi (Opsiyonel)
@@ -158,11 +146,20 @@ Bota ikinci (veya daha fazla) bir kişinin de erişmesini, aynı hatırlatıcıl
 
 `TEAM_ACCESS_CODE` boş bırakılırsa bot eskisi gibi tek kişilik çalışmaya devam eder, hiçbir şey değişmez.
 
+## 14. Yeni Eklenen Özellikler (Arama, Mükerrer Kontrol, Günlük Özet, Rapor)
+
+- **🔍 Kayıt Ara (İsim/ID)**: Ana menüden bu butona basıp bir isim ya da ID numarası yazın. Bot **tüm ülke sayfalarını** tarayıp eşleşen kayıtları (hangi ülkede, hangi ID'de, hangi durumda olduğunu) listeler.
+- **Mükerrer pasaport kontrolü**: Pasaport ekleme akışı tamamlandığında (fotoğraftan ya da elle), bot girilen pasaport numarasının **başka bir ülke sayfasında zaten kayıtlı olup olmadığını** otomatik kontrol eder. Kayıtlıysa hangi sayfada/ID'de olduğunu gösterip "Yine de ekle" veya "İptal" seçeneği sunar — yanlışlıkla aynı kişiyi iki kez eklemenizi engeller.
+- **📊 Rapor Al**: Ana menüden bu butona basıp bir tarih aralığı yazın (örn. `01.07.2026-31.07.2026`). Bot o aralıkta randevu günü olan tüm kayıtları (tüm ülke sayfalarından) toplayıp bir **Excel (.xlsx)** dosyası olarak Telegram'a gönderir.
+- **Günlük özet**: Her sabah (varsayılan saat 09:00, Türkiye saati — `DAILY_DIGEST_HOUR`/`DAILY_DIGEST_MINUTE` ile değiştirilebilir) bot otomatik olarak şu bilgileri içeren bir özet mesajı gönderir: bugün randevusu olanlar, henüz randevu alınmamış (bekleyen) kayıt sayısı ve pasaport süresi yakında (varsayılan 180 gün içinde — `PASSPORT_EXPIRY_WARN_DAYS`) dolacak kişiler.
+
+Bu 4 özellik için ek bir kurulum adımı gerekmez — Google Sheets bağlantınız (madde 12) zaten kuruluysa hepsi otomatik çalışır. `requirements.txt` dosyasına `openpyxl` eklendi (Excel rapor için); Render'da yeniden deploy ettiğinizde otomatik kurulur.
+
 ## Sorun Giderme
 
 - Bot hiç cevap vermiyor: Render "Logs" sekmesine bakın, webhook adımını (5) kontrol edin.
 - Servis "sleeping": UptimeRobot monitörünüzü kontrol edin.
-- Mail bildirimi gelmiyor: Render loglarında ilgili sağlayıcı (Gmail/Yandex/Outlook) için hata var mı bakın; Outlook'ta refresh token süresi dolmuşsa madde 8'i tekrarlayın.
+- Mail bildirimi gelmiyor: Render loglarında ilgili sağlayıcı (Gmail/Yandex) için hata var mı bakın; Yandex için IMAP'ın hesap ayarlarından açık olduğundan emin olun (madde 8).
 - Mail kontrolü "too many connections" gibi bir hata veriyor: `MAIL_CHECK_INTERVAL_SECONDS` değerini 15'ten 30-45'e çıkarın (çok sayıda hesapta sunucular çok sık bağlantıyı sınırlayabilir).
 - Takvim etkinliği oluşmuyor: Render loglarında Google hatası var mı bakın; refresh token süresi dolmuş olabilir, madde 9'u tekrarlayın.
 - Pasaport Ekle / Randevu Aldım butonu "Google Sheets bağlantısı kurulu değil" diyor: `GOOGLE_SHEETS_KURULUM.md` adımlarını tamamlayın, `GOOGLE_SERVICE_ACCOUNT_JSON` ve `SHEETS_SPREADSHEET_ID` değerlerini kontrol edin.
