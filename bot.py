@@ -340,6 +340,7 @@ def send_email(subject, body):
             "E-posta gonderilemedi: su ortam degiskenleri eksik/bos: %s", ", ".join(missing)
         )
         return
+    logger.info("E-posta gonderimi baslatiliyor (%d alici): %s", len(USER_EMAILS), ", ".join(USER_EMAILS))
     # USER_EMAIL virgulle birden fazla adres icerebilir - her birine ayri
     # gonderiyoruz (EmailJS'in ucretsiz sablonlari tek aliciya gore kurulu).
     for addr in USER_EMAILS:
@@ -354,6 +355,8 @@ def send_email(subject, body):
             r = requests.post("https://api.emailjs.com/api/v1.0/email/send", json=payload, timeout=10)
             if r.status_code != 200:
                 logger.error("EmailJS hatasi (%s): %s %s", addr, r.status_code, r.text)
+            else:
+                logger.info("EmailJS basarili (%s): %s", addr, r.text)
         except Exception as e:
             logger.error("E-posta gonderilemedi (%s): %s", addr, e)
 
