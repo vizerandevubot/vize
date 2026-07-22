@@ -113,17 +113,58 @@ Kalıcı ücretsiz bir SMS servisi yok. TextNow gibi ücretsiz görünen servisl
 
 ## 11. Kullanım
 
-Telegram'da botu açıp Telegram'ın "Start" düğmesine basın. Ana menüde:
+Telegram'da botu açıp Telegram'ın "Start" düğmesine basın. Klavyenizin altında kalıcı bir **"☰ Menü"** butonu belirir — sohbet ne kadar uzarsa uzasın, her an bu butona basarak ana menüye dönebilirsiniz. Ana menüde:
 
-- **➕ Hatırlatıcı Ekle**: takvimden gün, sonra saat, sonra dakika seçin. Ardından "ne zaman hatırlatayım" sorusunda birden fazla seçenek işaretleyebilirsiniz (örn. hem "1 gün önce" hem "tam zamanında") — vize randevusu için ikisini birden işaretlemenizi öneririm. En son kısa bir açıklama yazın (örn. "Vize randevusu - Alman Konsolosluğu"). Hatırlatıcı bir **ID numarası** ile kaydedilir hem (bağlıysa) takviminize hemen işlenir.
+- **➕ Hatırlatıcı Ekle**: takvimden günü seçin, ardından saati **yazarak** girin (örnek: `09:15`) — bu şekilde dakika hassasiyetinde, istediğiniz gibi girebilirsiniz. Sonra "ne zaman hatırlatayım" sorusunda birden fazla seçenek işaretleyebilirsiniz (örn. hem "1 gün önce" hem "tam zamanında") — vize randevusu için ikisini birden işaretlemenizi öneririm. En son kısa bir açıklama yazın (örn. "Vize randevusu - Alman Konsolosluğu"). Hatırlatıcı bir **ID numarası** ile kaydedilir hem (bağlıysa) takviminize hemen işlenir.
 - **📋 Tüm Hatırlatıcıları Gör**: eklediğiniz tüm hatırlatıcıları (geçmiş/tamamlanmış olanlar dahil) ID numaralarıyla birlikte listeler.
 - **🗑 Hatırlatıcı Sil**: bu butona bastıktan sonra silmek istediğiniz hatırlatıcının ID numarasını (örn. `3`) yazıp gönderin, bot o ID'ye sahip hatırlatıcıyı siler.
+- **🛂 Pasaport Ekle**: pasaport kaydı ekler, aşağıdaki madde 12'ye bakın.
+- **✅ Randevu Aldım**: bir kaydı "randevu alındı" olarak işaretler, aşağıdaki madde 12'ye bakın.
 
-Bağladığınız mail hesaplarına yeni bir şey geldiğinde, ayrıca bir şey yapmanıza gerek kalmadan bot size Telegram'dan haber verir.
+Bağladığınız mail hesaplarına yeni bir şey geldiğinde, ayrıca bir şey yapmanıza gerek kalmadan bot size Telegram'dan haber verir — artık gövde metni HTML karmaşası olmadan düzgün gösteriliyor, ekli/gömülü resimler (OTP kodları dahil) ve PDF/Word gibi dosyalar da otomatik olarak Telegram'a düşüyor. OTP kodlarının kısa sürede geçersiz olması nedeniyle mail kontrolü varsayılan olarak her **15 saniyede** bir çalışır (`MAIL_CHECK_INTERVAL_SECONDS`).
+
+**Gürültüyü azaltmak için**: VFS Global gibi randevu sistemlerinden gelen mailleri önceliklendirip güvenlik bildirimi gibi alakasız mailleri filtrelemek isterseniz, `EMAIL_KEYWORDS` değişkenini şu şekilde ayarlamanızı öneririm:
+```
+EMAIL_KEYWORDS=vize,visa,vfsglobal,vfs global,appointment,randevu,consulate,embassy,sefaret,konsolosluk,appointment letter,group urn
+```
+
+## 12. Pasaport → Google Sheets Entegrasyonu (Opsiyonel)
+
+Bu özellik, pasaport fotoğrafından bilgileri otomatik okuyup doğru ülke sayfanıza işler, ardından randevu alındığında satırı kırmızıya boyayıp master sayfaya kopyalar.
+
+**Kurulum (tek seferlik)**: adım adım talimatlar için `GOOGLE_SHEETS_KURULUM.md` dosyasına bakın. Özetle: bir Google Servis Hesabı oluşturup Sheets dosyanızı onunla paylaşacak, `GOOGLE_SERVICE_ACCOUNT_JSON` ve `SHEETS_SPREADSHEET_ID` değerlerini Render'a ekleyecek, her ülke sayfasına bir "ID" sütunu açacak ve [ocr.space](https://ocr.space/ocrapi/freekey) üzerinden ücretsiz bir `OCR_SPACE_API_KEY` alacaksınız. Yeni bir ülke sayfası eklediğinizde kodda hiçbir değişiklik gerekmez — bot sayfa listesini her seferinde canlı okur.
+
+**Kullanım — Pasaport Ekleme**:
+1. Ana Menü > **🛂 Pasaport Ekle**, ardından hangi ülke sayfasına ekleneceğini seçin.
+2. Pasaportun fotoğrafını gönderin (MRZ satırlarının — pasaportun alt kısmındaki iki satırın — net göründüğü bir açı).
+3. Bot isim, soyisim, pasaport no, doğum tarihi, pasaport SKT, uyruk ve kimlik no bilgilerini otomatik okuyup size gösterir. "✅ Doğru, Devam Et" ile onaylayın, okuma hatalıysa "🔁 Tekrar Çek" ile yeni foto gönderin, hiç okunmuyorsa "✍️ Elle Gir" ile tüm bilgileri tek tek yazarak girebilirsiniz.
+4. Onayladıktan sonra bot sırayla Vize Türü, İşlemi Yapan, Mail, Şifre, Tel bilgilerini soracak — yazıp gönderin. Son adımdan sonra kayıt ilgili ülke sayfasına bir ID numarasıyla ve **sarı** (bekleme listesi) renkle eklenir.
+
+**Kullanım — Randevu Aldım**:
+1. Ana Menü > **✅ Randevu Aldım**, ülke sayfasını seçin, kaydın ID numarasını yazın.
+2. Bot sırayla referans numarası, randevu günü (GG.AA.YYYY) ve saatini (SS:DD) soracak.
+3. Girdikten sonra ilgili satır **kırmızıya** boyanır, otomatik olarak `RANDEVU ALINMIŞLAR` (master) sayfasına kopyalanır ve girdiğiniz randevu günü/saati için **otomatik bir hatırlatıcı** (Telegram + takvim) oluşturulur — ayrıca elle hatırlatıcı eklemenize gerek kalmaz.
+
+Not: Pasaport numarası, kimlik no ve mail şifresi gibi hassas bilgiler düz metin olarak Google Sheets'e yazılıyor — tabloya kimlerin erişebildiğini kontrol etmenizi öneririm.
+
+## 13. Arkadaşınızın/Ekibinizin de Bota Erişmesi (Opsiyonel)
+
+Bota ikinci (veya daha fazla) bir kişinin de erişmesini, aynı hatırlatıcıları/pasaport kayıtlarını görmesini ve tüm bildirimleri (hatırlatıcı, yeni mail, randevu) almasını istiyorsanız:
+
+1. Render'a `TEAM_ACCESS_CODE` adında bir ortam değişkeni ekleyin, değeri kendiniz belirleyeceğiniz gizli bir kod olsun (örn. `Vize2026Ekip`).
+2. Bu kodu eklediğiniz kişiye (WhatsApp, SMS vb. güvenli bir yoldan) iletin.
+3. O kişi Telegram'da botunuzu bulup Telegram'ın "Start" düğmesine bassın, bot ondan erişim kodunu isteyecek, kodu yazıp göndersin.
+4. Kod doğruysa artık o kişi de sizinle **aynı** hatırlatıcıları, pasaport kayıtlarını görebilir/ekleyebilir/silebilir ve tüm bildirimleri alır.
+
+`TEAM_ACCESS_CODE` boş bırakılırsa bot eskisi gibi tek kişilik çalışmaya devam eder, hiçbir şey değişmez.
 
 ## Sorun Giderme
 
 - Bot hiç cevap vermiyor: Render "Logs" sekmesine bakın, webhook adımını (5) kontrol edin.
 - Servis "sleeping": UptimeRobot monitörünüzü kontrol edin.
 - Mail bildirimi gelmiyor: Render loglarında ilgili sağlayıcı (Gmail/Yandex/Outlook) için hata var mı bakın; Outlook'ta refresh token süresi dolmuşsa madde 8'i tekrarlayın.
+- Mail kontrolü "too many connections" gibi bir hata veriyor: `MAIL_CHECK_INTERVAL_SECONDS` değerini 15'ten 30-45'e çıkarın (çok sayıda hesapta sunucular çok sık bağlantıyı sınırlayabilir).
 - Takvim etkinliği oluşmuyor: Render loglarında Google hatası var mı bakın; refresh token süresi dolmuş olabilir, madde 9'u tekrarlayın.
+- Pasaport Ekle / Randevu Aldım butonu "Google Sheets bağlantısı kurulu değil" diyor: `GOOGLE_SHEETS_KURULUM.md` adımlarını tamamlayın, `GOOGLE_SERVICE_ACCOUNT_JSON` ve `SHEETS_SPREADSHEET_ID` değerlerini kontrol edin.
+- Pasaporttan bilgi okunmuyor: fotoğrafın net, parlamasız ve MRZ satırlarının (alttaki iki satır) tam göründüğünden emin olun; olmazsa "✍️ Elle Gir" ile devam edin.
+- Ekip arkadaşı botu açtığında hep "erişim kodu girin" diyor: `TEAM_ACCESS_CODE` değerini doğru yazdığından emin olun (büyük/küçük harf birebir eşleşmeli).
