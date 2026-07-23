@@ -105,6 +105,7 @@ Telegram'da botu açıp Telegram'ın "Start" düğmesine basın. Klavyenizin alt
 - **📋 Tüm Hatırlatıcıları Gör**: eklediğiniz tüm hatırlatıcıları (geçmiş/tamamlanmış olanlar dahil) ID numaralarıyla birlikte listeler.
 - **🗑 Hatırlatıcı Sil**: bu butona bastıktan sonra silmek istediğiniz hatırlatıcının ID numarasını (örn. `3`) yazıp gönderin, bot o ID'ye sahip hatırlatıcıyı siler.
 - **🛂 Pasaport Ekle**: pasaport kaydı ekler, aşağıdaki madde 12'ye bakın.
+- **🕑 Sıraya Girdi**: bir kaydı "sırada bekliyor" (waitlist) olarak işaretler, aşağıdaki madde 12'ye bakın.
 - **✅ Randevu Aldım**: bir kaydı "randevu alındı" olarak işaretler, aşağıdaki madde 12'ye bakın.
 
 Bağladığınız mail hesaplarına yeni bir şey geldiğinde, ayrıca bir şey yapmanıza gerek kalmadan bot size Telegram'dan haber verir — artık gövde metni HTML karmaşası olmadan düzgün gösteriliyor, ekli/gömülü resimler (OTP kodları dahil) ve PDF/Word gibi dosyalar da otomatik olarak Telegram'a düşüyor. OTP kodlarının kısa sürede geçersiz olması nedeniyle mail kontrolü varsayılan olarak her **15 saniyede** bir çalışır (`MAIL_CHECK_INTERVAL_SECONDS`).
@@ -116,18 +117,28 @@ EMAIL_KEYWORDS=vize,visa,vfsglobal,vfs global,appointment,randevu,consulate,emba
 
 ## 12. Pasaport → Google Sheets Entegrasyonu (Opsiyonel)
 
-Bu özellik, pasaport fotoğrafından bilgileri otomatik okuyup doğru ülke sayfanıza işler, ardından randevu alındığında satırı kırmızıya boyayıp master sayfaya kopyalar.
+Bu özellik, pasaport fotoğrafından bilgileri otomatik okuyup doğru ülke sayfanıza işler; kayıt sırada beklerken sarıya, randevu kesinleşince kırmızıya boyanıp master sayfaya kopyalanır.
 
 **Kurulum (tek seferlik)**: adım adım talimatlar için `GOOGLE_SHEETS_KURULUM.md` dosyasına bakın. Özetle: bir Google Servis Hesabı oluşturup Sheets dosyanızı onunla paylaşacak, `GOOGLE_SERVICE_ACCOUNT_JSON` ve `SHEETS_SPREADSHEET_ID` değerlerini Render'a ekleyecek, her ülke sayfasına bir "ID" sütunu açacak ve [ocr.space](https://ocr.space/ocrapi/freekey) üzerinden ücretsiz bir `OCR_SPACE_API_KEY` alacaksınız. Yeni bir ülke sayfası eklediğinizde kodda hiçbir değişiklik gerekmez — bot sayfa listesini her seferinde canlı okur.
+
+**Renk şeması** (ülke sayfalarında):
+- **Renksiz**: sadece pasaport kaydı yapıldı, henüz hiçbir işlem yok.
+- **Sarı**: kayıt sıraya girdi / waitlist'te bekliyor (bazı VFS sitelerinde — örn. Hollanda, Bulgaristan — önce sıraya alınıyor, kesin randevu daha sonra veriliyor).
+- **Kırmızı**: randevu kesinleşti, `RANDEVU ALINMIŞLAR` (master) sayfasına kopyalandı.
 
 **Kullanım — Pasaport Ekleme**:
 1. Ana Menü > **🛂 Pasaport Ekle**, ardından hangi ülke sayfasına ekleneceğini seçin.
 2. Pasaportun fotoğrafını gönderin (MRZ satırlarının — pasaportun alt kısmındaki iki satırın — net göründüğü bir açı).
 3. Bot isim, soyisim, pasaport no, doğum tarihi, pasaport SKT, uyruk ve kimlik no bilgilerini otomatik okuyup size gösterir. "✅ Doğru, Devam Et" ile onaylayın, okuma hatalıysa "🔁 Tekrar Çek" ile yeni foto gönderin, hiç okunmuyorsa "✍️ Elle Gir" ile tüm bilgileri tek tek yazarak girebilirsiniz.
-4. Onayladıktan sonra bot sırayla Vize Türü, İşlemi Yapan, Mail, Şifre, Tel bilgilerini soracak — yazıp gönderin. Son adımdan sonra kayıt ilgili ülke sayfasına bir ID numarasıyla ve **sarı** (bekleme listesi) renkle eklenir.
+4. Onayladıktan sonra bot sırayla Vize Türü, İşlemi Yapan, Yönlendiren Kişi, Mail, Şifre, Tel bilgilerini soracak — yazıp gönderin. Son adımdan sonra kayıt ilgili ülke sayfasına bir ID numarasıyla, **renksiz** olarak eklenir. Eğer girilen pasaport numarası başka bir sayfada veya RANDEVU ALINMIŞLAR'da zaten kayıtlıysa, bot eklemeden önce uyarıp onay ister.
+
+**Kullanım — Sıraya Girdi**:
+1. Ana Menü > **🕑 Sıraya Girdi**, ülke sayfasını seçin, kaydın ID numarasını yazın.
+2. Bot ek bir soru sormadan kaydı "Sırada Bekliyor" olarak işaretleyip satırı **sarıya** boyar. Master sayfaya kopyalanmaz, tarih/saat istenmez — bu sadece bir ön-aşama bilgisidir.
+3. Gerçek randevu netleştiğinde aynı kayıt için **✅ Randevu Aldım** akışını kullanmaya devam edebilirsiniz (sıradaki kayıtlar da o listede görünür).
 
 **Kullanım — Randevu Aldım**:
-1. Ana Menü > **✅ Randevu Aldım**, ülke sayfasını seçin, kaydın ID numarasını yazın.
+1. Ana Menü > **✅ Randevu Aldım**, ülke sayfasını seçin, kaydın ID numarasını yazın (sırada bekleyen kayıtlar da bu listede görünür).
 2. Bot sırayla referans numarası, randevu günü (GG.AA.YYYY) ve saatini (SS:DD) soracak.
 3. Girdikten sonra ilgili satır **kırmızıya** boyanır, otomatik olarak `RANDEVU ALINMIŞLAR` (master) sayfasına kopyalanır ve girdiğiniz randevu günü/saati için **otomatik bir hatırlatıcı** (Telegram + takvim) oluşturulur — ayrıca elle hatırlatıcı eklemenize gerek kalmaz.
 
