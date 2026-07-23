@@ -3,6 +3,7 @@ import re
 import time
 import json
 import socket
+import threading
 import html as html_lib
 import base64
 import mimetypes
@@ -1740,14 +1741,43 @@ def check_new_mail():
 SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 
+_SHEETS_CREDS = None
+_SHEETS_CREDS_LOCK = threading.Lock()
+
+
+def _get_sheets_credentials():
+    """
+    Kimlik bilgilerini (credentials) SADECE BIR KEZ olusturup modul
+    seviyesinde onbellekler - her cagrida yeniden JSON parse edip yeni
+    bir kimlik nesnesi kurmak, her seferinde gereksiz bir OAuth token
+    degisimi (agdan ekstra bir istek) demekti.
+    """
+    global _SHEETS_CREDS
+    if _SHEETS_CREDS is None:
+        with _SHEETS_CREDS_LOCK:
+            if _SHEETS_CREDS is None:
+                info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+                _SHEETS_CREDS = ServiceAccountCredentials.from_service_account_info(info, scopes=SHEETS_SCOPES)
+    return _SHEETS_CREDS
+
+
 def get_sheets_service():
     if not GOOGLE_LIBS_AVAILABLE:
         return None
     if not (GOOGLE_SERVICE_ACCOUNT_JSON and SHEETS_SPREADSHEET_ID):
         return None
     try:
-        info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-        creds = ServiceAccountCredentials.from_service_account_info(info, scopes=SHEETS_SCOPES)
+        creds = _get_sheets_credentials()
+        # ONEMLI: build() burada HER cagrida yeni, ayri bir HTTP tasiyici
+        # (transport/soket) nesnesi kurar - ayni kimlik bilgisini paylasir
+        # ama BAGLANTIYI paylasmaz. Bu bilerek boyle - ayni service/http
+        # nesnesini BIRDEN FAZLA THREAD'DEN ES ZAMANLI kullanmak (orn.
+        # _fetch_all_country_grids'in paralel taramasinda) thread-safe
+        # DEGILDI ve SSL/soket durumunun bozulmasina, hatta surecin
+        # cokmesine ("corrupted size vs. prev_size") yol aciyordu. cache_discovery=False
+        # + guncel google-api-python-client'in gomulu ("static") discovery
+        # belgeleri sayesinde bu cagri agdan bir sey CEKMEZ, sadece yerel
+        # bir nesne kurar - yani her thread icin ayri ayri cagirmak ucuzdur.
         return build("sheets", "v4", credentials=creds, cache_discovery=False)
     except Exception as e:
         logger.error("Sheets servisi olusturulamadi: %s", e)
@@ -2103,20 +2133,34 @@ def _fetch_all_country_grids(service, countries, max_workers=8):
     okuma toplam sureyi katlayarak uzatip botun butonlara yanit verirken
     "kasilmasina" yol aciyordu. Paralelde toplam sure en yavas TEK sayfa
     kadar olur, sayfalarin toplami kadar degil.
+
+    ONEMLI: 'service' parametresi burada YALNIZCA GOOGLE_LIBS_AVAILABLE=False
+    durumunda erken cikis icin kontrol amaciyla var - fiili okuma her
+    thread'in KENDI olusturdugu ayri bir Sheets istemcisiyle yapilir. Ayni
+    'service' nesnesini birden fazla thread'den es zamanli kullanmak
+    thread-safe degildi (httplib2 tabanli baglanti/soket durumu bozuluyor,
+    bu da "SSL: decryption failed", "The read operation timed out" ve hatta
+    surecin cokmesine ("corrupted size vs. prev_size") yol aciyordu).
+
     Donus: {ulke: (grid, header_row_idx, headers)} sozlugu (okunamayan
     sayfalar sozlukte yer almaz).
     """
     results = {}
     if not countries:
         return results
+
+    def _fetch_one(country):
+        thread_service = get_sheets_service() or service
+        grid = get_sheet_grid(thread_service, country)
+        header_row_idx, headers = get_header_row(thread_service, country, grid)
+        return grid, header_row_idx, headers
+
     with ThreadPoolExecutor(max_workers=min(len(countries), max_workers)) as executor:
-        futures = {executor.submit(get_sheet_grid, service, c): c for c in countries}
+        futures = {executor.submit(_fetch_one, c): c for c in countries}
         for f in as_completed(futures):
             country = futures[f]
             try:
-                grid = f.result()
-                header_row_idx, headers = get_header_row(service, country, grid)
-                results[country] = (grid, header_row_idx, headers)
+                results[country] = f.result()
             except Exception as e:
                 logger.error("'%s' sayfasi okunamadi (paralel): %s", country, e)
     return results
