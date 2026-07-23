@@ -455,6 +455,7 @@ def build_main_menu_keyboard():
         [InlineKeyboardButton("\U0001f4cb Tum Hatirlaticilari Gor", callback_data="list")],
         [InlineKeyboardButton("\U0001f5d1 Hatirlatici Sil", callback_data="delprompt")],
         [InlineKeyboardButton("\U0001f6c2 Pasaport Ekle", callback_data="passport_add")],
+        [InlineKeyboardButton("\U0001f551 Siraya Girdi", callback_data="waitlist_start")],
         [InlineKeyboardButton("✅ Randevu Aldim", callback_data="appt_start")],
         [InlineKeyboardButton("\U0001f4cb Pasaport Kayitlarini Gor", callback_data="passport_list_start")],
         [InlineKeyboardButton("\U0001f50d Kayit Ara (Isim/ID)", callback_data="search_start")],
@@ -816,6 +817,59 @@ def button_router(update: Update, context: CallbackContext):
         )
         return
 
+    # --- Siraya Girdi (waitlist) akisi ---
+    if data == "waitlist_start":
+        query.answer()
+        service = get_sheets_service()
+        if not service:
+            replace_ui(
+                query,
+                "Google Sheets baglantisi kurulu degil. Lutfen once GOOGLE_SERVICE_ACCOUNT_JSON "
+                "ve SHEETS_SPREADSHEET_ID ayarlarini tamamlayin.",
+                build_main_menu_keyboard(),
+            )
+            return
+        keyboard, names = build_country_keyboard(service, "waitlist_country")
+        if not names:
+            replace_ui(query, "Tabloda hicbir ulke sayfasi bulunamadi.", build_main_menu_keyboard())
+            return
+        PENDING[chat_id] = {"country_list": names}
+        replace_ui(query, "Hangi ulke sayfasindaki kayit siraya girdi?", keyboard)
+        return
+
+    if data.startswith("waitlist_country|"):
+        _, idx = data.split("|")
+        pending = PENDING.get(chat_id, {})
+        names = pending.get("country_list", [])
+        try:
+            country = names[int(idx)]
+        except Exception:
+            query.answer("Gecersiz secim, tekrar deneyin.", show_alert=True)
+            return
+        query.answer()
+        PENDING[chat_id] = {"country_sheet": country, "awaiting_waitlist_id": True}
+
+        service = get_sheets_service()
+        records_text = ""
+        if service:
+            try:
+                records = list_country_records(service, country, only_pending=True)
+            except Exception as e:
+                logger.error("Kayit listesi alinamadi: %s", e)
+                records = []
+            if records:
+                lines = [f"#{rid} - {isim}" if isim else f"#{rid}" for rid, isim, _ in records[:50]]
+                records_text = "\n\nBekleyen kayitlar:\n" + "\n".join(lines)
+            else:
+                records_text = "\n\n(Bu sayfada bekleyen kayit gorunmuyor.)"
+
+        replace_ui(
+            query,
+            f"'{country}' sayfasindaki kaydin ID numarasini yazip gonderin (sadece sayi, orn. 5)."
+            f"{records_text}",
+        )
+        return
+
     # --- Pasaport kayitlarini goruntuleme (sadece listeleme, duzenlemez) ---
     if data == "passport_list_start":
         query.answer()
@@ -1112,6 +1166,35 @@ def handle_text_input(update: Update, context: CallbackContext):
         update.message.reply_text("Ana Menu:", reply_markup=build_main_menu_keyboard())
         return
 
+    if pending and pending.get("awaiting_waitlist_id"):
+        raw = raw_text.lstrip("#")
+        try:
+            target_id = int(raw)
+        except ValueError:
+            update.message.reply_text("Lutfen sadece ID numarasini yazin (orn. 5).")
+            return
+        service = get_sheets_service()
+        country = pending["country_sheet"]
+        PENDING.pop(chat_id, None)
+        if not service:
+            update.message.reply_text("Google Sheets baglantisi kurulu degil.", reply_markup=build_main_menu_keyboard())
+            return
+        row_index, headers, row_values = find_row_by_id(service, country, target_id)
+        if row_index is None:
+            update.message.reply_text(
+                f"'{country}' sayfasinda ID {target_id} bulunamadi.", reply_markup=build_main_menu_keyboard()
+            )
+            return
+        apply_extra_fields_to_row(
+            service, country, row_index, headers, row_values, {"islem_sonucu": WAITLIST_STATUS_TEXT}
+        )
+        set_row_color(service, country, row_index, "yellow")
+        update.message.reply_text(
+            f"'{country}' sayfasinda #{target_id} 'Sirada Bekliyor' olarak isaretlendi (sari).",
+            reply_markup=build_main_menu_keyboard(),
+        )
+        return
+
     if pending and pending.get("awaiting_appt_id"):
         raw = raw_text.lstrip("#")
         try:
@@ -1173,7 +1256,7 @@ def handle_text_input(update: Update, context: CallbackContext):
             "referans": pending.get("referans", ""),
             "randevu_gunu": pending.get("randevu_gunu", ""),
             "saat": saat,
-            "islem_sonucu": "Randevu Alindi",
+            "islem_sonucu": CONFIRMED_STATUS_TEXT,
         }
         updated_row = apply_extra_fields_to_row(
             service, country, row_index, headers, pending["row_values"], extra_fields
@@ -1816,6 +1899,12 @@ COLOR_MAP = {
     "red": {"red": 0.96, "green": 0.5, "blue": 0.5},
 }
 
+# "Islem Sonucu" sutununda kullanilan durum metinleri. Sirada bekleyen
+# (waitlist) kayitlar da kirmiziya boyanir ama master sayfaya kopyalanmaz -
+# sadece kesin randevu (CONFIRMED_STATUS_TEXT) master'a kopyalanir.
+WAITLIST_STATUS_TEXT = "Sirada Bekliyor"
+CONFIRMED_STATUS_TEXT = "Randevu Alindi"
+
 
 def set_row_color(service, sheet_name, row_index, color_name):
     sheet_ids = get_sheet_id_map(service)
@@ -1865,7 +1954,9 @@ def write_passport_row(service, sheet_name, field_values):
         valueInputOption="USER_ENTERED",
         body={"values": [row]},
     ).execute()
-    set_row_color(service, sheet_name, row_index, "yellow")
+    # Sadece pasaport kaydi yapildiginda satir RENKSIZ kalir - sari renk
+    # "Sirada Bekliyor" (waitlist) isaretlenince, kirmizi ise "Randevu
+    # Alindi" isaretlenince uygulanir.
     # Bot kendi ekledigi satiri "gorulmus" olarak isaretler, boylece asagidaki
     # periyodik pasaport-satiri tarama isi bu satiri TEKRAR bildirim olarak
     # gondermez (bot zaten kullaniciya kayit eklendi mesaji gosteriyor).
@@ -1993,7 +2084,11 @@ def list_country_records(service, sheet_name, only_pending=True):
         if not rid:
             continue
         sonuc = cell(row, sonuc_col)
-        if only_pending and sonuc:
+        # "pending" = henuz kesin randevu alinmamis kayitlar. Waitlist
+        # ("Sirada Bekliyor") durumundaki kayitlar da hala "Randevu Aldim"
+        # akisinda secilebilir olmali, bu yuzden sadece kesin onaylanmis
+        # (CONFIRMED_STATUS_TEXT) kayitlar listeden cikarilir.
+        if only_pending and sonuc and sonuc == CONFIRMED_STATUS_TEXT:
             continue
         isim = f"{cell(row, isim_col)} {cell(row, soyisim_col)}".strip()
         records.append((rid, isim, sonuc))
