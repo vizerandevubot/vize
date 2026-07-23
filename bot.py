@@ -9,6 +9,7 @@ import imaplib
 import email as email_lib
 import logging
 import calendar as pycalendar
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from datetime import datetime, timedelta, date
 from queue import Queue
@@ -1604,8 +1605,27 @@ def poll_imap_account(account_key, host, user, password, label):
 
 
 def check_new_mail():
-    for acc in IMAP_ACCOUNTS:
-        poll_imap_account(acc["key"], acc["host"], acc["address"], acc["password"], acc["label"])
+    # Hesaplar SIRAYLA degil PARALEL taranir - hesap sayisi arttikca (10-15+)
+    # sirayla tarama toplam sureyi kolayca 15sn'nin uzerine tasiyip
+    # scheduler'in "maximum number of running instances reached" diyerek
+    # sonraki turleri atlamasina (ve mail bildiriminin dakikalarca gecikmesine)
+    # yol aciyordu. Paralel taramada toplam sure en yavas hesap kadar olur,
+    # hesaplarin toplami kadar degil.
+    if not IMAP_ACCOUNTS:
+        return
+    max_workers = min(len(IMAP_ACCOUNTS), 15)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(
+                poll_imap_account, acc["key"], acc["host"], acc["address"], acc["password"], acc["label"]
+            )
+            for acc in IMAP_ACCOUNTS
+        ]
+        for f in as_completed(futures):
+            try:
+                f.result()
+            except Exception as e:
+                logger.error("IMAP hesap taramasi beklenmeyen hata: %s", e)
 
 
 # =============================================================================
