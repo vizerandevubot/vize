@@ -1669,8 +1669,13 @@ def poll_imap_account(account_key, host, user, password, label):
     try:
         # timeout onemli: yavas/yanit vermeyen tek bir hesap butun
         # check_new_mail turunu kilitleyip diger hesaplarin da gecikmesine
-        # yol acmasin diye.
-        imap = imaplib.IMAP4_SSL(host, 993, timeout=10)
+        # yol acmasin diye. Render'in ucretsiz plani tek, kisitli/paylasimli
+        # bir CPU verdigi icin, bu thread ne kadar uzun "takilirsa" ayni
+        # surectekiTelegram webhook isteklerine de o kadar az CPU zamani
+        # kaliyor (buton yanitlarinin gecikmesi buradan geliyor). 10sn yerine
+        # 6sn - normal baglantilar icin hala fazlasiyla yeterli, ama
+        # yanit vermeyen bir sunucu CPU'yu daha kisa sure mesgul ediyor.
+        imap = imaplib.IMAP4_SSL(host, 993, timeout=6)
         try:
             imap.login(user, password)
             imap.select("INBOX")
