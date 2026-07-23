@@ -28,7 +28,7 @@ Telegram'da **@BotFather** ile sohbet açın, `/newbot` yazın (bu, botu oluştu
 
 - **Runtime**: Python 3
 - **Build Command**: `pip install -r requirements.txt`
-- **Start Command**: `gunicorn --workers 1 --threads 8 bot:app` (workers 1 şart, yoksa hatırlatmalar birden fazla kez gider; threads sayısı botun "kasılmasını" azaltmak için 4'ten 8'e çıkarıldı)
+- **Start Command**: `gunicorn --workers 1 --threads 4 bot:app` (workers 1 şart, yoksa hatırlatmalar birden fazla kez gider. Render'ın ücretsiz planı kısıtlı bellek sunduğu için threads sayısını yüksek tutmayın — 8'e çıkarmak, arka plandaki paralel taramalarla birleşince bellek yetersizliğine [OOM] ve sürekli çökmeye yol açtı, 4'te kalın)
 - **Instance Type**: Free
 
 "Environment" sekmesinden en azından şunları ekleyin: `TELEGRAM_TOKEN`, `WEBHOOK_SECRET` (kendiniz uydurun, tahmin edilemez bir metin), `MONGO_URI`. Deploy edin, Render size bir adres verir (örn. `https://is-ajandasi.onrender.com`).
