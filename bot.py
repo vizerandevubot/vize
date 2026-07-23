@@ -2027,6 +2027,45 @@ def _fetch_all_country_grids(service, countries, max_workers=8):
     return results
 
 
+def get_master_rows_as_dicts(service):
+    """
+    'RANDEVU ALINMIŞLAR' (master) sayfasindaki her satiri, sutun basligina
+    gore alan-anahtarina (field key, orn. "randevu_gunu", "isim") eslenmis
+    bir sozluk olarak dondurur.
+
+    Kullanicinin gercek is akisinda randevu gunu/saati ve nihai islem
+    sonucu SADECE bu sayfada tam olarak tutuluyor - ulke sayfalarina
+    sadece pasaport kaydi ve (varsa) kisa bir durum notu yaziliyor. Bu
+    yuzden rapor/arama/gunluk ozet gibi tarih temelli islemler bu sayfayi
+    kullanmali.
+    """
+    grid = get_sheet_grid(service, MASTER_SHEET_NAME)
+    header_row_idx, headers = get_header_row(service, MASTER_SHEET_NAME, grid)
+    if not headers:
+        return []
+
+    col_map = {}
+    for i, h in enumerate(headers):
+        key = match_header_to_field(h)
+        if key and key not in col_map:
+            col_map[key] = i
+
+    id_col = col_map.get("id")
+    if id_col is None:
+        return []
+
+    def cell(row, idx):
+        return row[idx] if idx is not None and idx < len(row) and row[idx] else ""
+
+    rows = []
+    for row in grid[header_row_idx:]:
+        rid = cell(row, id_col)
+        if not rid:
+            continue
+        rows.append({key: cell(row, idx) for key, idx in col_map.items()})
+    return rows
+
+
 def search_records(service, query_text):
     """
     Isim (soyisim dahil) veya ID numarasina gore TUM ulke sayfalarinda arama
@@ -2074,6 +2113,29 @@ def search_records(service, query_text):
                 match = True
             if match:
                 results.append((country, rid, isim_full, cell(row, sonuc_col)))
+
+    # RANDEVU ALINMIŞLAR (master) sayfasinda da ara - randevu gunu/saati ve
+    # nihai islem sonucu sadece bu sayfada tam olarak tutuluyor.
+    for r in get_master_rows_as_dicts(service):
+        rid = r.get("id", "")
+        if not rid:
+            continue
+        isim_full = f"{r.get('isim', '')} {r.get('soyisim', '')}".strip()
+        match = False
+        if q_id is not None:
+            try:
+                if int(float(str(rid).strip())) == q_id:
+                    match = True
+            except Exception:
+                pass
+        if not match and q and q in isim_full.lower():
+            match = True
+        if match:
+            gun = r.get("randevu_gunu", "")
+            saat = r.get("saat", "")
+            sonuc = r.get("islem_sonucu", "") or "Randevu Alindi"
+            when = f" {gun} {saat}".rstrip() if gun else ""
+            results.append((MASTER_SHEET_NAME, rid, isim_full, f"{sonuc}{when}"))
     return results
 
 
@@ -2104,14 +2166,24 @@ def find_passport_duplicate(service, pasaport_no):
             if val == target:
                 rid = row[id_col] if id_col is not None and id_col < len(row) else "?"
                 return country, rid
+
+    # RANDEVU ALINMIŞLAR (master) sayfasinda da kontrol et.
+    for r in get_master_rows_as_dicts(service):
+        pn = re.sub(r"[^A-Z0-9]", "", (r.get("pasaport_no", "") or "").upper())
+        if pn and pn == target:
+            return MASTER_SHEET_NAME, r.get("id", "?")
     return None
 
 
 def generate_appointment_report(service, start_date, end_date):
     """
     start_date/end_date (date nesneleri) araligindaki randevu gunune sahip
-    kayitlari TUM ulke sayfalarindan toplayip bir Excel workbook'u (BytesIO)
-    olarak dondurur. Hic kayit yoksa None dondurur.
+    kayitlari 'RANDEVU ALINMIŞLAR' (master) sayfasindan toplayip bir Excel
+    workbook'u (BytesIO) olarak dondurur. Hic kayit yoksa None dondurur.
+
+    Not: Randevu gunu/saati ve nihai islem sonucu SADECE master sayfasinda
+    tam olarak tutuluyor (ulke sayfalarina sadece pasaport kaydi yaziliyor),
+    bu yuzden rapor da bu sayfayi kaynak alir.
     """
     try:
         from openpyxl import Workbook
@@ -2119,45 +2191,22 @@ def generate_appointment_report(service, start_date, end_date):
         return None
 
     rows_out = []
-    countries = list_country_sheets(service)
-    grids = _fetch_all_country_grids(service, countries)
-    for country in countries:
-        entry = grids.get(country)
-        if not entry:
+    for r in get_master_rows_as_dicts(service):
+        rid = r.get("id", "")
+        gun = r.get("randevu_gunu", "")
+        if not rid or not gun:
             continue
-        grid, header_row_idx, headers = entry
-
-        id_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "id"), None)
-        isim_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "isim"), None)
-        soyisim_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "soyisim"), None)
-        vize_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "vize_turu"), None)
-        gun_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "randevu_gunu"), None)
-        saat_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "saat"), None)
-        referans_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "referans"), None)
-        sonuc_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "islem_sonucu"), None)
-        if id_col is None or gun_col is None:
+        try:
+            d = datetime.strptime(gun, "%d.%m.%Y").date()
+        except Exception:
             continue
-
-        def cell(row, idx):
-            return row[idx] if idx is not None and idx < len(row) and row[idx] else ""
-
-        for row in grid[header_row_idx:]:
-            rid = cell(row, id_col)
-            gun = cell(row, gun_col)
-            if not rid or not gun:
-                continue
-            try:
-                d = datetime.strptime(gun, "%d.%m.%Y").date()
-            except Exception:
-                continue
-            if not (start_date <= d <= end_date):
-                continue
-            rows_out.append((d, [
-                country, rid,
-                cell(row, isim_col), cell(row, soyisim_col),
-                cell(row, vize_col), gun, cell(row, saat_col),
-                cell(row, referans_col), cell(row, sonuc_col),
-            ]))
+        if not (start_date <= d <= end_date):
+            continue
+        rows_out.append((d, [
+            rid, r.get("isim", ""), r.get("soyisim", ""),
+            r.get("vize_turu", ""), gun, r.get("saat", ""),
+            r.get("referans", ""), r.get("islem_sonucu", ""),
+        ]))
 
     if not rows_out:
         return None
@@ -2167,7 +2216,7 @@ def generate_appointment_report(service, start_date, end_date):
     wb = Workbook()
     ws = wb.active
     ws.title = "Randevu Raporu"
-    ws.append(["Ulke", "ID", "Isim", "Soyisim", "Vize Turu", "Randevu Gunu", "Saat", "Referans", "Islem Sonucu"])
+    ws.append(["ID", "Isim", "Soyisim", "Vize Turu", "Randevu Gunu", "Saat", "Referans", "Islem Sonucu"])
     for _d, row_data in rows_out:
         ws.append(row_data)
 
@@ -2185,15 +2234,46 @@ def send_daily_digest():
     Her sabah (DAILY_DIGEST_HOUR:DAILY_DIGEST_MINUTE, Turkiye saati) calisir:
     bugunku randevu sayisi, bekleyen kayit sayisi ve suresi yakinda dolacak
     pasaportlari ozetleyen bir Telegram mesaji gonderir.
+
+    Kaynak ayrimi: "bugun randevusu olan" ve randevusu zaten alinmis
+    kisilerin pasaport SKT'si RANDEVU ALINMIŞLAR (master) sayfasindan
+    okunur (tarih/saat sadece orada tam tutuluyor). "Bekleyen" sayisi ve
+    onlarin SKT'si ise ulke sayfalarindan, master'da ZATEN olan pasaport
+    numaralari haric tutularak hesaplanir (mukerrer saymamak icin).
     """
     service = get_sheets_service()
     if not service:
         return
     today = datetime.now(TZ).date()
     total_appt_today = 0
-    total_pending = 0
     expiring_soon = []
 
+    master_rows = get_master_rows_as_dicts(service)
+    master_pasaport_nos = set()
+    for r in master_rows:
+        pn = re.sub(r"[^A-Z0-9]", "", (r.get("pasaport_no", "") or "").upper())
+        if pn:
+            master_pasaport_nos.add(pn)
+        gun = r.get("randevu_gunu", "")
+        if gun:
+            try:
+                d = datetime.strptime(gun, "%d.%m.%Y").date()
+                if d == today:
+                    total_appt_today += 1
+            except Exception:
+                pass
+        skt = r.get("pasaport_skt", "")
+        if skt:
+            try:
+                d2 = datetime.strptime(skt, "%d.%m.%Y").date()
+                days_left = (d2 - today).days
+                if 0 <= days_left <= PASSPORT_EXPIRY_WARN_DAYS:
+                    isim = f"{r.get('isim', '')} {r.get('soyisim', '')}".strip()
+                    expiring_soon.append((MASTER_SHEET_NAME, r.get("id", ""), isim, skt, days_left))
+            except Exception:
+                pass
+
+    total_pending = 0
     countries = list_country_sheets(service)
     grids = _fetch_all_country_grids(service, countries)
     for country in countries:
@@ -2205,8 +2285,7 @@ def send_daily_digest():
         id_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "id"), None)
         isim_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "isim"), None)
         soyisim_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "soyisim"), None)
-        sonuc_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "islem_sonucu"), None)
-        gun_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "randevu_gunu"), None)
+        pn_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "pasaport_no"), None)
         skt_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "pasaport_skt"), None)
         if id_col is None:
             continue
@@ -2218,17 +2297,12 @@ def send_daily_digest():
             rid = cell(row, id_col)
             if not rid:
                 continue
-            sonuc = cell(row, sonuc_col)
-            if not sonuc:
-                total_pending += 1
-            gun = cell(row, gun_col)
-            if gun:
-                try:
-                    d = datetime.strptime(gun, "%d.%m.%Y").date()
-                    if d == today:
-                        total_appt_today += 1
-                except Exception:
-                    pass
+            pn = re.sub(r"[^A-Z0-9]", "", cell(row, pn_col).upper()) if pn_col is not None else ""
+            already_confirmed = bool(pn) and pn in master_pasaport_nos
+            if already_confirmed:
+                # Bu kisi zaten RANDEVU ALINMIŞLAR'da sayildi, mukerrer sayma.
+                continue
+            total_pending += 1
             skt = cell(row, skt_col)
             if skt:
                 try:
