@@ -2131,20 +2131,21 @@ def list_country_records(service, sheet_name, only_pending=True):
 
 def _fetch_all_country_grids(service, countries, max_workers=3):
     """
-    Birden fazla ulke sayfasini SIRAYLA degil PARALEL okur. Arama, rapor,
-    mukerrer kontrol, gunluk ozet ve yeni-kayit taramasi gibi TUM sayfalari
-    gezen islemler bunu kullanir - ulke sayisi arttikca (10-15+) sirayla
-    okuma toplam sureyi katlayarak uzatip botun butonlara yanit verirken
-    "kasilmasina" yol aciyordu. Paralelde toplam sure en yavas TEK sayfa
-    kadar olur, sayfalarin toplami kadar degil.
+    Birden fazla ulke sayfasini TEK, PAYLASILAN bir Sheets baglantisi
+    uzerinden SIRAYLA okur.
 
-    ONEMLI: 'service' parametresi burada YALNIZCA GOOGLE_LIBS_AVAILABLE=False
-    durumunda erken cikis icin kontrol amaciyla var - fiili okuma her
-    thread'in KENDI olusturdugu ayri bir Sheets istemcisiyle yapilir. Ayni
-    'service' nesnesini birden fazla thread'den es zamanli kullanmak
-    thread-safe degildi (httplib2 tabanli baglanti/soket durumu bozuluyor,
-    bu da "SSL: decryption failed", "The read operation timed out" ve hatta
-    surecin cokmesine ("corrupted size vs. prev_size") yol aciyordu).
+    NOT: Bu fonksiyon daha once thread-havuzuyla PARALEL calisiyordu.
+    Iki ayri sorun cikardi: (1) ayni 'service' nesnesini birden fazla
+    thread'den es zamanli kullanmak thread-safe degildi (SSL/soket
+    bozulmasi, "corrupted size vs. prev_size" cokmesi), (2) bunu
+    duzeltmek icin her thread'e KENDI Sheets istemcisini kurdurmak da
+    her 60 saniyede bir ulke basina yepyeni bir httplib2 baglanti
+    nesnesi acilmasi demekti - bunlarin duzgun temizlenmemesi (dosya
+    tanitici/bellek sizintisi) Render'in kisitli ucretsiz plani
+    uzerinde birkac dakika icinde surecin tekrar tekrar cokmesine
+    (OOM) yol acti. Kararlilik hizdan daha onemli oldugu icin bu
+    fonksiyon artik TEK bir baglanti nesnesiyle, sirayla calisiyor -
+    daha yavas ama katbekat daha az kaynak tuketiyor.
 
     Donus: {ulke: (grid, header_row_idx, headers)} sozlugu (okunamayan
     sayfalar sozlukte yer almaz).
@@ -2152,21 +2153,13 @@ def _fetch_all_country_grids(service, countries, max_workers=3):
     results = {}
     if not countries:
         return results
-
-    def _fetch_one(country):
-        thread_service = get_sheets_service() or service
-        grid = get_sheet_grid(thread_service, country)
-        header_row_idx, headers = get_header_row(thread_service, country, grid)
-        return grid, header_row_idx, headers
-
-    with ThreadPoolExecutor(max_workers=min(len(countries), max_workers)) as executor:
-        futures = {executor.submit(_fetch_one, c): c for c in countries}
-        for f in as_completed(futures):
-            country = futures[f]
-            try:
-                results[country] = f.result()
-            except Exception as e:
-                logger.error("'%s' sayfasi okunamadi (paralel): %s", country, e)
+    for country in countries:
+        try:
+            grid = get_sheet_grid(service, country)
+            header_row_idx, headers = get_header_row(service, country, grid)
+            results[country] = (grid, header_row_idx, headers)
+        except Exception as e:
+            logger.error("'%s' sayfasi okunamadi: %s", country, e)
     return results
 
 
