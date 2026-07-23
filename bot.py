@@ -2605,6 +2605,32 @@ def parse_mrz(lines):
     return fields, valid
 
 
+# ---------------------------------------------------------------------------
+# Kendi kendini uyandirma (self-ping): Render'in ucretsiz plani, servise
+# ~15 dakika boyunca DISARIDAN hicbir HTTP istegi gelmezse onu uyku moduna
+# aliyor. UptimeRobot bunu engellemesi gereken servis ama tek basina yeterli
+# olmayabiliyor (gecikmeli/atlanan yoklama, bolge bazli kesinti vb.). Bu
+# yuzden botun kendisi de, APScheduler uzerinden, kendi genel adresine
+# duzenli araliklarla gercek bir disa-donuk HTTP istegi atarak Render'in
+# "aktiflik" sayacini sifirliyor - UptimeRobot devre disi kalsa bile.
+# RENDER_EXTERNAL_URL degiskenini Render otomatik olarak saglar; o yoksa
+# SELF_PING_URL ile elle belirtilebilir.
+SELF_PING_URL = (
+    os.environ.get("RENDER_EXTERNAL_URL")
+    or os.environ.get("SELF_PING_URL")
+    or "https://vize-zy2j.onrender.com"
+).rstrip("/")
+SELF_PING_INTERVAL_SECONDS = int(os.environ.get("SELF_PING_INTERVAL_SECONDS", "600"))
+
+
+def keep_alive():
+    try:
+        r = requests.get(SELF_PING_URL + "/", timeout=15)
+        logger.info("Self-ping basarili: %s -> %s", SELF_PING_URL, r.status_code)
+    except Exception as e:
+        logger.warning("Self-ping basarisiz (%s): %s", SELF_PING_URL, e)
+
+
 REMINDER_CHECK_INTERVAL_SECONDS = int(os.environ.get("REMINDER_CHECK_INTERVAL_SECONDS", "20"))
 # Pasaport eklemeleri hatirlatici/mail kadar saniye hassasiyeti gerektirmedigi
 # icin varsayilan biraz daha gevsek - Sheets API'ye gereksiz yuk binmesin.
@@ -2616,6 +2642,7 @@ DAILY_DIGEST_MINUTE = int(os.environ.get("DAILY_DIGEST_MINUTE", "0"))
 scheduler = BackgroundScheduler(timezone="UTC")
 scheduler.add_job(check_due_reminders, "interval", seconds=REMINDER_CHECK_INTERVAL_SECONDS, max_instances=1)
 scheduler.add_job(check_new_mail, "interval", seconds=MAIL_CHECK_INTERVAL_SECONDS, max_instances=1)
+scheduler.add_job(keep_alive, "interval", seconds=SELF_PING_INTERVAL_SECONDS, max_instances=1)
 if GOOGLE_LIBS_AVAILABLE:
     scheduler.add_job(check_new_passport_rows, "interval", seconds=PASSPORT_CHECK_INTERVAL_SECONDS, max_instances=1)
     # Scheduler'in kendisi UTC calisiyor; kullanilan APScheduler surumu
