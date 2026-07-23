@@ -1420,7 +1420,7 @@ def html_to_text(raw_html):
     return " ".join(text.split())
 
 
-def get_email_body_snippet(msg, limit=500):
+def get_email_body_snippet(msg, limit=4000):
     body = ""
     html_fallback = ""
     if msg.is_multipart():
@@ -1527,6 +1527,20 @@ def send_telegram_file(chat_id, filename, data, content_type):
         logger.error("Dosya gonderilemedi (%s): %s", filename, e)
 
 
+def send_long_message(text, max_len=3800):
+    # Telegram tek mesajda en fazla 4096 karakter kabul ediyor - uzun mail
+    # govdelerinin sessizce basarisiz olup hic gitmemesi yerine, gerekirse
+    # birden fazla mesaja bolerek gonderiyoruz.
+    if len(text) <= max_len:
+        broadcast_message(text)
+        return
+    chunks = [text[i:i + max_len] for i in range(0, len(text), max_len)]
+    total = len(chunks)
+    for i, chunk in enumerate(chunks, 1):
+        suffix = f"\n\n[{i}/{total}]" if total > 1 else ""
+        broadcast_message(chunk + suffix)
+
+
 def notify_new_mail(provider, sender, subject, body, attachments=None):
     if not mail_matches_filter(sender, subject, body):
         return
@@ -1535,7 +1549,7 @@ def notify_new_mail(provider, sender, subject, body, attachments=None):
         return
     body_clean = (body or "").strip() or "(govde metni yok)"
     text = f"\U0001f4e7 Yeni e-posta ({provider})\nKimden: {sender}\nKonu: {subject}\n\n{body_clean}"
-    broadcast_message(text)
+    send_long_message(text)
 
     for att in (attachments or []):
         if len(att["data"]) > MAIL_ATTACHMENT_MAX_BYTES:
