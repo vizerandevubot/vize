@@ -1720,7 +1720,11 @@ def check_new_mail():
     # hesaplarin toplami kadar degil.
     if not IMAP_ACCOUNTS:
         return
-    max_workers = min(len(IMAP_ACCOUNTS), 15)
+    # Render'in ucretsiz plani kisitli bellek/CPU sunuyor - cok fazla
+    # ayni anda acik SSL baglantisi (15'e kadar) bellegi tasirip surecin
+    # OOM (bellek yetersizligi) nedeniyle cokmesine yol acabiliyordu. 4,
+    # hizi büyük olcude korurken kaynagi da makul tutan bir denge.
+    max_workers = min(len(IMAP_ACCOUNTS), 4)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
             executor.submit(
@@ -2125,7 +2129,7 @@ def list_country_records(service, sheet_name, only_pending=True):
     return records
 
 
-def _fetch_all_country_grids(service, countries, max_workers=8):
+def _fetch_all_country_grids(service, countries, max_workers=3):
     """
     Birden fazla ulke sayfasini SIRAYLA degil PARALEL okur. Arama, rapor,
     mukerrer kontrol, gunluk ozet ve yeni-kayit taramasi gibi TUM sayfalari
