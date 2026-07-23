@@ -2,6 +2,7 @@ import os
 import re
 import time
 import json
+import socket
 import html as html_lib
 import base64
 import mimetypes
@@ -15,6 +16,14 @@ from datetime import datetime, timedelta, date
 from queue import Queue
 from zoneinfo import ZoneInfo
 from email.header import decode_header
+
+# Google Sheets/Takvim API'si (httplib2 uzerinden) ve baska hicbir zaman
+# asimi belirtilmemis diger aglar icin genel bir guvenlik agi: sunucu tarafi
+# bir sekilde yanit vermezse thread sonsuza kadar degil, en fazla bu sure
+# kadar bekler. Bu, botun bazen "kasilmasinin" olasi nedenlerinden biriydi -
+# 4 webhook thread'inden biri boyle bir cagriya takilirsa butonlar yanitsiz
+# kalabiliyordu.
+socket.setdefaulttimeout(25)
 
 from flask import Flask, request
 from telegram import (
@@ -1911,10 +1920,13 @@ def check_new_passport_rows():
         logger.error("Ulke sayfalari listelenemedi: %s", e)
         return
 
+    grids = _fetch_all_country_grids(service, countries)
     for country in countries:
+        entry = grids.get(country)
+        if not entry:
+            continue
         try:
-            grid = get_sheet_grid(service, country)
-            header_row_idx, headers = get_header_row(service, country, grid)
+            grid, header_row_idx, headers = entry
             current_count = len(grid)
             seen_count = get_seen_row_count(country)
 
@@ -1988,6 +2000,33 @@ def list_country_records(service, sheet_name, only_pending=True):
     return records
 
 
+def _fetch_all_country_grids(service, countries, max_workers=8):
+    """
+    Birden fazla ulke sayfasini SIRAYLA degil PARALEL okur. Arama, rapor,
+    mukerrer kontrol, gunluk ozet ve yeni-kayit taramasi gibi TUM sayfalari
+    gezen islemler bunu kullanir - ulke sayisi arttikca (10-15+) sirayla
+    okuma toplam sureyi katlayarak uzatip botun butonlara yanit verirken
+    "kasilmasina" yol aciyordu. Paralelde toplam sure en yavas TEK sayfa
+    kadar olur, sayfalarin toplami kadar degil.
+    Donus: {ulke: (grid, header_row_idx, headers)} sozlugu (okunamayan
+    sayfalar sozlukte yer almaz).
+    """
+    results = {}
+    if not countries:
+        return results
+    with ThreadPoolExecutor(max_workers=min(len(countries), max_workers)) as executor:
+        futures = {executor.submit(get_sheet_grid, service, c): c for c in countries}
+        for f in as_completed(futures):
+            country = futures[f]
+            try:
+                grid = f.result()
+                header_row_idx, headers = get_header_row(service, country, grid)
+                results[country] = (grid, header_row_idx, headers)
+            except Exception as e:
+                logger.error("'%s' sayfasi okunamadi (paralel): %s", country, e)
+    return results
+
+
 def search_records(service, query_text):
     """
     Isim (soyisim dahil) veya ID numarasina gore TUM ulke sayfalarinda arama
@@ -2001,13 +2040,13 @@ def search_records(service, query_text):
         pass
 
     results = []
-    for country in list_country_sheets(service):
-        try:
-            grid = get_sheet_grid(service, country)
-            header_row_idx, headers = get_header_row(service, country, grid)
-        except Exception as e:
-            logger.error("'%s' sayfasi okunamadi (arama): %s", country, e)
+    countries = list_country_sheets(service)
+    grids = _fetch_all_country_grids(service, countries)
+    for country in countries:
+        entry = grids.get(country)
+        if not entry:
             continue
+        grid, header_row_idx, headers = entry
 
         id_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "id"), None)
         isim_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "isim"), None)
@@ -2046,13 +2085,13 @@ def find_passport_duplicate(service, pasaport_no):
     target = re.sub(r"[^A-Z0-9]", "", (pasaport_no or "").upper())
     if not target:
         return None
-    for country in list_country_sheets(service):
-        try:
-            grid = get_sheet_grid(service, country)
-            header_row_idx, headers = get_header_row(service, country, grid)
-        except Exception as e:
-            logger.error("'%s' sayfasi okunamadi (mukerrer kontrol): %s", country, e)
+    countries = list_country_sheets(service)
+    grids = _fetch_all_country_grids(service, countries)
+    for country in countries:
+        entry = grids.get(country)
+        if not entry:
             continue
+        grid, header_row_idx, headers = entry
 
         pn_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "pasaport_no"), None)
         id_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "id"), None)
@@ -2080,13 +2119,13 @@ def generate_appointment_report(service, start_date, end_date):
         return None
 
     rows_out = []
-    for country in list_country_sheets(service):
-        try:
-            grid = get_sheet_grid(service, country)
-            header_row_idx, headers = get_header_row(service, country, grid)
-        except Exception as e:
-            logger.error("'%s' sayfasi okunamadi (rapor): %s", country, e)
+    countries = list_country_sheets(service)
+    grids = _fetch_all_country_grids(service, countries)
+    for country in countries:
+        entry = grids.get(country)
+        if not entry:
             continue
+        grid, header_row_idx, headers = entry
 
         id_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "id"), None)
         isim_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "isim"), None)
@@ -2155,13 +2194,13 @@ def send_daily_digest():
     total_pending = 0
     expiring_soon = []
 
-    for country in list_country_sheets(service):
-        try:
-            grid = get_sheet_grid(service, country)
-            header_row_idx, headers = get_header_row(service, country, grid)
-        except Exception as e:
-            logger.error("'%s' sayfasi okunamadi (gunluk ozet): %s", country, e)
+    countries = list_country_sheets(service)
+    grids = _fetch_all_country_grids(service, countries)
+    for country in countries:
+        entry = grids.get(country)
+        if not entry:
             continue
+        grid, header_row_idx, headers = entry
 
         id_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "id"), None)
         isim_col = next((i for i, h in enumerate(headers) if match_header_to_field(h) == "isim"), None)
