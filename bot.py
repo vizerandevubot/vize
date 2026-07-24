@@ -489,7 +489,12 @@ IDENTITY_FIELD_PROMPTS = [
     ("kimlik_no", "Kimlik No nedir?"),
 ]
 
-DATE_PATTERN = re.compile(r"^\s*(0[1-9]|[12]\d|3[01])\.(0[1-9]|1[0-2])\.(20\d{2})\s*$")
+# NOT: Eskiden yil kismi sadece "20\d{2}" (2000-2099) kabul ediyordu. Bu alan
+# hem randevu tarihi (genelde 20xx) hem de dogum tarihi (cogunlukla 19xx)
+# icin kullanildigindan, ornegin "16.07.1977" gibi 1900'lu yillardaki dogum
+# tarihleri hep "format hatali" diye reddediliyordu. Simdi 1900-2099 arasini
+# kabul ediyor.
+DATE_PATTERN = re.compile(r"^\s*(0[1-9]|[12]\d|3[01])\.(0[1-9]|1[0-2])\.(19\d{2}|20\d{2})\s*$")
 
 FIELD_LABELS = {
     "isim": "Isim", "soyisim": "Soyisim", "pasaport_no": "Pasaport No",
