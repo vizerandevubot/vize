@@ -1425,18 +1425,27 @@ def handle_photo_message(update: Update, context: CallbackContext):
     if mrz_lines:
         fields, valid = parse_mrz(mrz_lines)
 
-    ai_used = False
+    # Okuma sirasi: 1) MRZ (checksum ile dogrulanir, en guvenilir).
+    # 2) MRZ bulunamazsa, ZATEN yapilmis olan OCR taramasinin tam metninden
+    # pasaportun ust kismindaki yazili/etiketli alanlari (VIZ) regex ile
+    # okumayi dener - ek servis/maliyet yok. 3) O da bir sey bulamazsa son
+    # care olarak Gemini (yapay zeka) dener - ancak Google'in kimlik belgesi
+    # fotograflarina yonelik PII guvenlik kisitlamasi nedeniyle bu adim
+    # genelde basarisiz olabilir, bu yuzden en sona birakildi.
+    source = "mrz"
     if not fields:
-        # MRZ (OCR.space + checksum) okunamadi - yedek olarak Gemini gorsel
-        # okumayi dener (yapilandirilmissa). Bu, egik/parlak/MRZ satirlari
-        # kirpilmis fotograflarda son bir sans veriyor.
+        fields = extract_viz_fields(raw_text)
+        valid = False
+        source = "viz"
+    if not fields:
         fields, valid = gemini_extract_passport_fields(photo_bytes)
-        ai_used = fields is not None
+        source = "gemini"
 
     if not fields:
         update.message.reply_text(
-            "Pasaporttaki bilgiler okunamadi" + (" (MRZ ve yapay zeka ikisi de basarisiz)." if GEMINI_API_KEY else " (MRZ satirlari okunamadi).") +
-            " Daha net, duz acili bir fotoyla tekrar deneyebilir ya da bilgileri elle girebilirsiniz.",
+            "Pasaporttaki bilgiler okunamadi (MRZ, sayfadaki yazili alanlar"
+            + (" ve yapay zeka" if GEMINI_API_KEY else "") + " denendi). "
+            "Daha net, duz acili bir fotoyla tekrar deneyebilir ya da bilgileri elle girebilirsiniz.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("\U0001f501 Tekrar Cek", callback_data="passport_confirm_no")],
                 [InlineKeyboardButton("✍️ Elle Gir", callback_data="passport_manual_start")],
@@ -1447,7 +1456,13 @@ def handle_photo_message(update: Update, context: CallbackContext):
     pending["mrz_fields"] = fields
     pending.pop("awaiting_passport_photo", None)
     ozet = "\n".join(f"{FIELD_LABELS.get(k, k)}: {v or '(bos)'}" for k, v in fields.items())
-    if ai_used:
+    if source == "viz":
+        uyari = (
+            "\n\n\U0001f4c4 Bu bilgiler MRZ okunamadigi icin pasaporttaki yazili alanlardan "
+            "(OCR ile) okundu - dogrulanmadi, ozellikle pasaport no, kimlik no ve tarihleri "
+            "dikkatlice kontrol edin."
+        )
+    elif source == "gemini":
         uyari = (
             "\n\n\U0001f916 Bu bilgiler MRZ okunamadigi icin yapay zeka (Gemini) ile okundu, "
             "MRZ dogrulamasi yapilamadi - ozellikle pasaport no, kimlik no ve son kullanma "
@@ -2721,6 +2736,137 @@ def ocr_space_extract_text(image_bytes):
     except Exception as e:
         logger.error("OCR istegi basarisiz: %s", e)
         return None
+
+
+# Ay kisaltmalari (Turkce/Ingilizce) -> ay numarasi. Turk pasaportlarinda
+# tarihler genelde "16 ARA/DEC 2022" gibi cift dilde kisaltmayla yazilir.
+MONTH_ABBR_MAP = {
+    "OCA": "01", "JAN": "01",
+    "SUB": "02", "FEB": "02",
+    "MAR": "03",
+    "NIS": "04", "APR": "04",
+    "MAY": "05",
+    "HAZ": "06", "JUN": "06",
+    "TEM": "07", "JUL": "07",
+    "AGU": "08", "AUG": "08",
+    "EYL": "09", "SEP": "09",
+    "EKI": "10", "OCT": "10",
+    "KAS": "11", "NOV": "11",
+    "ARA": "12", "DEC": "12",
+}
+_VIZ_DATE_NUMERIC = re.compile(r"(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{4})")
+_VIZ_DATE_MONTHNAME = re.compile(r"(\d{1,2})\s*([A-Z]{3})(?:\s*/\s*[A-Z]{3})?\s*(\d{4})")
+
+
+def _find_date_near(text, idx, window=80):
+    """idx konumundan sonraki `window` karakter icinde bir tarih arar,
+    GG.AA.YYYY string olarak dondurur ya da None."""
+    snippet = text[idx: idx + window]
+    m = _VIZ_DATE_NUMERIC.search(snippet)
+    if m:
+        gun, ay, yil = m.groups()
+        try:
+            if 1 <= int(gun) <= 31 and 1 <= int(ay) <= 12:
+                return f"{int(gun):02d}.{int(ay):02d}.{yil}"
+        except Exception:
+            pass
+    m = _VIZ_DATE_MONTHNAME.search(snippet)
+    if m:
+        gun, ay_kis, yil = m.groups()
+        ay = MONTH_ABBR_MAP.get(ay_kis)
+        if ay:
+            try:
+                if 1 <= int(gun) <= 31:
+                    return f"{int(gun):02d}.{ay}.{yil}"
+            except Exception:
+                pass
+    return None
+
+
+def extract_viz_fields(raw_text):
+    """
+    MRZ (pasaportun en alt kismindaki iki satirlik kod) okunamadiginda devreye
+    giren YEDEK: yeni bir servise ihtiyac duymadan, OCR.space'in fotografin
+    TAMAMINDAN okudugu ham metinde (raw_text) pasaportun UST kismindaki
+    yazili/etiketli alanlari (Visual Inspection Zone) regex ile arar. Bu
+    zaten yapilan OCR cagrisinin ciktisini yeniden kullandigi icin ek maliyet
+    yok ve Gemini gibi bir uretken yapay zekanin kimlik-belgesi guvenlik
+    kisitlamalarina (PII engeli) takilmiyor.
+
+    NOT: MRZ'nin checksum ile dogrulanmasi kadar guvenilir DEGIL - OCR
+    hatalarina (harf/rakam karisikligi, satir kaymasi) acik oldugu icin
+    kullaniciya HER ZAMAN "dikkatlice kontrol edin" uyarisi gosterilmeli.
+    Donus: fields dict (parse_mrz ile ayni anahtarlar) ya da None.
+    """
+    if not raw_text:
+        return None
+    text = raw_text.upper()
+
+    # Pasaportlarda etiketler genelde iki dilde ayni satirda yazilir
+    # ("SURNAME/SOYADI") ve GERCEK DEGER bir SONRAKI satirdadir. Bu yuzden
+    # etiketten sonraki penceredeki satirlari tek tek gezip, HALA baska bir
+    # etiketin parcasi olan satirlari (bu listedeki kelimelerden birini
+    # iceren) atlayip ilk "gercek deger gibi duran" satiri aliyoruz.
+    _LABEL_HINTS = [
+        "SURNAME", "SOYADI", "GIVEN NAME", "ADI", "NATIONALITY", "UYRUGU",
+        "PASSPORT NO", "PASAPORT NO", "DOCUMENT NO", "PERSONAL NO", "KIMLIK NO",
+        "DATE OF BIRTH", "DOGUM TARIHI", "DATE OF EXPIRY", "GECERLILIK",
+        "SEX", "CINSIYET", "PLACE OF BIRTH", "DOGUM YERI", "DATE OF ISSUE",
+        "VERILIS TARIHI", "AUTHORITY", "MAKAM",
+    ]
+
+    def find_value_after(labels):
+        for label in labels:
+            idx = text.find(label)
+            if idx == -1:
+                continue
+            window = text[idx + len(label): idx + len(label) + 120]
+            lines = [l.strip(" :./-") for l in window.split("\n")]
+            lines = [l for l in lines if l]
+            val = None
+            for line in lines:
+                if any(hint in line for hint in _LABEL_HINTS):
+                    continue
+                val = re.sub(r"\s{2,}", " ", line)
+                break
+            if val and len(val) >= 2:
+                return val
+        return None
+
+    def find_date_after(labels):
+        for label in labels:
+            idx = text.find(label)
+            if idx == -1:
+                continue
+            d = _find_date_near(text, idx + len(label))
+            if d:
+                return d
+        return None
+
+    # Ingilizce etiketler once aranir (OCR "language": "eng" ile calistigi
+    # icin Turkce karakterli etiketleri yanlis okuma ihtimali daha yuksek).
+    soyisim = find_value_after(["SURNAME", "SOYADI"])
+    isim = find_value_after(["GIVEN NAMES", "GIVEN NAME", "ADI"])
+    pasaport_no = find_value_after(
+        ["PASSPORT NO", "DOCUMENT NUMBER", "DOCUMENT NO", "PASAPORT NO", "BELGE NO"]
+    )
+    uyruk = find_value_after(["NATIONALITY", "UYRUGU"])
+    kimlik_no = find_value_after(["PERSONAL NUMBER", "PERSONAL NO", "KIMLIK NO"])
+    dogum_tarihi = find_date_after(["DATE OF BIRTH", "DOGUM TARIHI"])
+    pasaport_skt = find_date_after(["DATE OF EXPIRY", "GECERLILIK TARIHI", "SON GECERLILIK"])
+
+    fields = {
+        "isim": (isim or "").strip(),
+        "soyisim": (soyisim or "").strip(),
+        "pasaport_no": re.sub(r"[^A-Z0-9]", "", pasaport_no or ""),
+        "kimlik_no": re.sub(r"[^A-Z0-9]", "", kimlik_no or ""),
+        "dogum_tarihi": dogum_tarihi or "",
+        "pasaport_skt": pasaport_skt or "",
+        "uyruk": (uyruk or "").strip(),
+    }
+    if not fields["isim"] and not fields["pasaport_no"]:
+        return None
+    return fields
 
 
 def extract_mrz_lines(raw_text):
