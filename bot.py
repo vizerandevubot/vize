@@ -1189,10 +1189,19 @@ def handle_text_input(update: Update, context: CallbackContext):
                 f"'{country}' sayfasinda ID {target_id} bulunamadi.", reply_markup=build_main_menu_keyboard()
             )
             return
-        apply_extra_fields_to_row(
-            service, country, row_index, headers, row_values, {"islem_sonucu": WAITLIST_STATUS_TEXT}
-        )
-        set_row_color(service, country, row_index, "yellow")
+        try:
+            apply_extra_fields_to_row(
+                service, country, row_index, headers, row_values, {"islem_sonucu": WAITLIST_STATUS_TEXT}
+            )
+            set_row_color(service, country, row_index, "yellow")
+        except Exception as e:
+            logger.error("Waitlist isaretleme basarisiz (%s, ID %s): %s", country, target_id, e)
+            update.message.reply_text(
+                f"'{country}' sayfasinda #{target_id} isaretlenirken hata olustu, Sheets'e yazilamadi. "
+                f"Lutfen tekrar deneyin. (Hata: {e})",
+                reply_markup=build_main_menu_keyboard(),
+            )
+            return
         update.message.reply_text(
             f"'{country}' sayfasinda #{target_id} 'Sirada Bekliyor' olarak isaretlendi (sari).",
             reply_markup=build_main_menu_keyboard(),
@@ -1262,11 +1271,29 @@ def handle_text_input(update: Update, context: CallbackContext):
             "saat": saat,
             "islem_sonucu": CONFIRMED_STATUS_TEXT,
         }
-        updated_row = apply_extra_fields_to_row(
-            service, country, row_index, headers, pending["row_values"], extra_fields
-        )
-        set_row_color(service, country, row_index, "red")
-        copy_to_master(service, headers, updated_row, extra_fields)
+        # Bu uc adim (satiri guncelle -> kirmiziya boya -> master'a kopyala)
+        # eskiden hatalari sessizce yutuyordu; biri basarisiz olsa bile
+        # kullaniciya "basarili" mesaji gosterilip hatirlatici da
+        # olusturuluyordu - master sayfada ya da ulke sayfasinda hicbir
+        # degisiklik olmamasina ragmen. Artik herhangi biri patlarsa
+        # PENDING'i temizleyip kullaniciya ACIKCA hata gosteriyoruz ve
+        # hatirlatici/basari mesaji OLUSTURULMUYOR.
+        try:
+            updated_row = apply_extra_fields_to_row(
+                service, country, row_index, headers, pending["row_values"], extra_fields
+            )
+            set_row_color(service, country, row_index, "red")
+            copy_to_master(service, headers, updated_row, extra_fields)
+        except Exception as e:
+            logger.error("Randevu aldim islemi basarisiz (%s, ID uzerinden): %s", country, e)
+            PENDING.pop(chat_id, None)
+            update.message.reply_text(
+                "Randevu bilgisi kaydedilirken bir hata olustu, Sheets'e yazilamadi. "
+                "Lutfen 'Randevu Aldim' islemini bastan tekrar deneyin. "
+                f"(Hata: {e})",
+                reply_markup=build_main_menu_keyboard(),
+            )
+            return
 
         # Tablodaki randevu gunu/saatini hatirlatici sistemiyle birlestir: bu
         # akistan gecen her randevu icin otomatik bir Telegram/takvim
@@ -1973,10 +2000,13 @@ def set_row_color(service, sheet_name, row_index, color_name):
             }
         }]
     }
-    try:
-        service.spreadsheets().batchUpdate(spreadsheetId=SHEETS_SPREADSHEET_ID, body=body).execute()
-    except Exception as e:
-        logger.error("Satir renklendirilemedi: %s", e)
+    # NOT: Eskiden hata burada sessizce yutuluyordu. Renklendirme aslinda
+    # sadece gorsel oldugu icin tek basina kritik degil, ama cagiran yer
+    # (handle_text_input) artik "randevu aldim" akisindaki UC adimi
+    # (satiri guncelle -> renklendir -> master'a kopyala) tek bir islem gibi
+    # ele alip herhangi biri basarisiz olursa kullaniciyi bilgilendiriyor -
+    # bu yuzden burada da hatayi yukari firlatiyoruz.
+    service.spreadsheets().batchUpdate(spreadsheetId=SHEETS_SPREADSHEET_ID, body=body).execute()
 
 
 def write_passport_row(service, sheet_name, field_values):
@@ -2478,6 +2508,16 @@ def send_daily_digest():
 
 
 def copy_to_master(service, headers, row_values, extra_fields):
+    """
+    NOT: Bu fonksiyon eskiden master sayfasinin basliklari okunamadiginda
+    (or. gecici bir Sheets API hatasi/ag sorunu) sessizce return ediyordu -
+    hicbir hata firlatilmiyor, hicbir yere loglanmiyordu. Bu yuzden bazen
+    "randevu aldim" akisinin sonunda kullaniciya basarili mesaji gosterilip
+    hatirlatici da olusturulurken, master sayfaya SATIR HIC EKLENMIYORDU ve
+    kimse fark etmiyordu ta ki tabloya bakana kadar. Artik boyle bir durumda
+    ACIKCA hata firlatiyoruz ki cagiran yer (handle_text_input) kullaniciya
+    dogru bilgi versin ve basarisiz islemi "basarili" gibi gostermesin.
+    """
     data = {}
     for h, v in zip(headers, row_values):
         key = match_header_to_field(h)
@@ -2488,7 +2528,9 @@ def copy_to_master(service, headers, row_values, extra_fields):
     master_grid = get_sheet_grid(service, MASTER_SHEET_NAME)
     _, master_headers = get_header_row(service, MASTER_SHEET_NAME, master_grid)
     if not master_headers:
-        return
+        raise RuntimeError(
+            f"'{MASTER_SHEET_NAME}' sayfasinin baslik satiri okunamadi (bos/erisilemedi)."
+        )
     _, next_row = get_next_id_and_row(service, MASTER_SHEET_NAME, master_grid)
     new_row = []
     for h in master_headers:
@@ -2520,15 +2562,17 @@ def apply_extra_fields_to_row(service, sheet_name, row_index, headers, row_value
         if key and key in extra_fields:
             row_values[i] = extra_fields[key]
     last_col = colnum_to_letter(len(headers))
-    try:
-        service.spreadsheets().values().update(
-            spreadsheetId=SHEETS_SPREADSHEET_ID,
-            range=f"'{sheet_name}'!A{row_index}:{last_col}{row_index}",
-            valueInputOption="USER_ENTERED",
-            body={"values": [row_values]},
-        ).execute()
-    except Exception as e:
-        logger.error("Satir guncellenemedi: %s", e)
+    # NOT: Eskiden buradaki hata sadece loglanip yutuluyordu - Sheets API
+    # yazma islemi gercekten basarisiz olsa bile fonksiyon "basariliymis gibi"
+    # row_values'i geri donduruyordu. Bu da "randevu aldim" akisinda ulke
+    # sayfasina hicbir sey yazilmadigi halde kullaniciya basarili mesaji
+    # gosterilmesine yol aciyordu. Artik hatayi yukari firlatiyoruz.
+    service.spreadsheets().values().update(
+        spreadsheetId=SHEETS_SPREADSHEET_ID,
+        range=f"'{sheet_name}'!A{row_index}:{last_col}{row_index}",
+        valueInputOption="USER_ENTERED",
+        body={"values": [row_values]},
+    ).execute()
     return row_values
 
 
