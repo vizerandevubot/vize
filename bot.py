@@ -99,6 +99,11 @@ GOOGLE_CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "primary")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
 SHEETS_SPREADSHEET_ID = os.environ.get("SHEETS_SPREADSHEET_ID")
 OCR_SPACE_API_KEY = os.environ.get("OCR_SPACE_API_KEY")
+# MRZ (OCR.space) okuyamadiginda yedek olarak devreye giren yapay zeka
+# gorsel okuma servisi. Google Gemini ucretsiz kotasi oldugu icin secildi
+# (aistudio.google.com'dan kredi karti gerekmeden alinabilir).
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 MASTER_SHEET_NAME = os.environ.get("MASTER_SHEET_NAME", "RANDEVU ALINMIŞLAR")
 ACCOUNTS_SHEET_NAME = os.environ.get("ACCOUNTS_SHEET_NAME", "hesap tanımla")
 
@@ -1420,10 +1425,18 @@ def handle_photo_message(update: Update, context: CallbackContext):
     if mrz_lines:
         fields, valid = parse_mrz(mrz_lines)
 
+    ai_used = False
+    if not fields:
+        # MRZ (OCR.space + checksum) okunamadi - yedek olarak Gemini gorsel
+        # okumayi dener (yapilandirilmissa). Bu, egik/parlak/MRZ satirlari
+        # kirpilmis fotograflarda son bir sans veriyor.
+        fields, valid = gemini_extract_passport_fields(photo_bytes)
+        ai_used = fields is not None
+
     if not fields:
         update.message.reply_text(
-            "Pasaporttaki MRZ satirlari (en alttaki iki satir) okunamadi. Daha net, duz "
-            "acili bir fotoyla tekrar deneyebilir ya da bilgileri elle girebilirsiniz.",
+            "Pasaporttaki bilgiler okunamadi" + (" (MRZ ve yapay zeka ikisi de basarisiz)." if GEMINI_API_KEY else " (MRZ satirlari okunamadi).") +
+            " Daha net, duz acili bir fotoyla tekrar deneyebilir ya da bilgileri elle girebilirsiniz.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("\U0001f501 Tekrar Cek", callback_data="passport_confirm_no")],
                 [InlineKeyboardButton("✍️ Elle Gir", callback_data="passport_manual_start")],
@@ -1434,7 +1447,14 @@ def handle_photo_message(update: Update, context: CallbackContext):
     pending["mrz_fields"] = fields
     pending.pop("awaiting_passport_photo", None)
     ozet = "\n".join(f"{FIELD_LABELS.get(k, k)}: {v or '(bos)'}" for k, v in fields.items())
-    uyari = "" if valid else "\n\n⚠️ Kontrol basamagi dogrulanamadi, bilgileri dikkatlice kontrol edin."
+    if ai_used:
+        uyari = (
+            "\n\n\U0001f916 Bu bilgiler MRZ okunamadigi icin yapay zeka (Gemini) ile okundu, "
+            "MRZ dogrulamasi yapilamadi - ozellikle pasaport no, kimlik no ve son kullanma "
+            "tarihini dikkatlice kontrol edin."
+        )
+    else:
+        uyari = "" if valid else "\n\n⚠️ Kontrol basamagi dogrulanamadi, bilgileri dikkatlice kontrol edin."
     update.message.reply_text(
         f"Pasaporttan okunanlar ('{country}' sayfasi icin):\n{ozet}{uyari}\n\nDogru mu?",
         reply_markup=InlineKeyboardMarkup([
@@ -2582,6 +2602,104 @@ def apply_extra_fields_to_row(service, sheet_name, row_index, headers, row_value
 
 
 # --- Pasaport OCR (OCR.space) + MRZ ayristirma ---
+GEMINI_PASSPORT_PROMPT = """Sana bir pasaportun fotografi verilecek. Bu fotograf sana
+gonderiliyor CUNKU pasaportun EN ALTINDAKI MRZ kodu (iki satirlik makine-okunabilir
+kod) okunamadi/hasarli/kirpilmis/net degil. BU YUZDEN MRZ satirlarini OKUMAYA
+CALISMA, ONLARA GUVENME - bunun yerine pasaportun UST/ORTA kismindaki, insan
+tarafindan okunmak icin YAZILI/BASILI, ETIKETLI alanlara bak (orn. "Soyadi/Surname",
+"Adi/Given Names", "Pasaport No/Passport No/Document No", "Uyrugu/Nationality",
+"Dogum Tarihi/Date of birth", "Cinsiyeti/Sex", "Verilis Tarihi/Date of issue",
+"Gecerlilik Tarihi/Date of expiry", "Kimlik No/Personal No" gibi). Bu alanlar
+genelde MRZ'den cok daha net/buyuk puntoyla basilidir, oradan oku.
+
+Gorevin, pasaporttaki bilgileri bu ETIKETLI ALANLARDAN OKUYUP asagidaki alanlarla
+SADECE gecerli bir JSON nesnesi olarak dondurmek. Baska hicbir metin, aciklama ya
+da markdown kod bloğu (```) EKLEME.
+
+Alanlar (hepsi string, bulunamayan/emin olunamayan alan icin BOS STRING "" don -
+ASLA tahmin etme/uydurma):
+- "isim": Kisinin adi (soyadi haric).
+- "soyisim": Kisinin soyadi.
+- "pasaport_no": Pasaport numarasi. COK ONEMLI - harf/rakam karisimini
+  dikkatlice oku, 0/O, 1/I, 5/S gibi karakterleri karistirma.
+- "kimlik_no": TC kimlik numarasi ya da pasaportun "Personal No" / "Kimlik No"
+  alaninda yazan numara (varsa).
+- "dogum_tarihi": Dogum tarihi, MUTLAKA "GG.AA.YYYY" formatinda (orn. 16.12.1977).
+- "pasaport_skt": Pasaportun son kullanma tarihi, MUTLAKA "GG.AA.YYYY"
+  formatinda. COK ONEMLI - bu tarihi kesinlikle dogru oku.
+- "uyruk": Uyruk/milliyet (orn. TURK, TURKIYE, T.C.).
+
+ONEMLI TARIH KURALI: Turk pasaportlarinda tarihler genelde iki dilde, ay
+ismi kisaltmasiyla yazilir (orn. "16 ARA/DEC 2022", "05 MAR/MAR 1990").
+Turkce/Ingilizce ay kisaltmalarini SAYIYA cevir:
+OCA/JAN=01, SUB/FEB=02, MAR/MAR=03, NIS/APR=04, MAY/MAY=05, HAZ/JUN=06,
+TEM/JUL=07, AGU/AUG=08, EYL/SEP=09, EKI/OCT=10, KAS/NOV=11, ARA/DEC=12.
+Yani "16 ARA/DEC 2022" -> "16.12.2022" olarak yaz. Yil HER ZAMAN 4 haneli olmali.
+
+pasaport_no, kimlik_no ve pasaport_skt alanlarinda hataya yer yok - emin
+degilsen o alani bos birak, yanlis/uydurma deger YAZMA."""
+
+
+def gemini_extract_passport_fields(image_bytes):
+    """
+    MRZ satirlari (OCR.space + checksum) okunamadiginda devreye giren yedek:
+    fotografi doğrudan Gemini'ye (gorsel anlama modeli) gonderip alanlari
+    JSON olarak okutuyoruz. MRZ'nin checksum dogrulamasi burada YOK, bu
+    yuzden donen "valid" her zaman False - kullaniciya "AI ile okundu,
+    dikkatlice kontrol edin" uyarisi gosterilip onay ekraninda kontrol
+    ettiriliyor (Sheets'e hicbir sey kullanici onaylamadan yazilmiyor).
+    Donus: (fields dict ya da None, valid=False)
+    """
+    if not GEMINI_API_KEY:
+        return None, False
+    try:
+        b64 = base64.b64encode(image_bytes).decode("ascii")
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+        )
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"text": GEMINI_PASSPORT_PROMPT},
+                    {"inline_data": {"mime_type": "image/jpeg", "data": b64}},
+                ]
+            }],
+            "generationConfig": {
+                "temperature": 0,
+                "responseMimeType": "application/json",
+            },
+        }
+        r = requests.post(url, json=payload, timeout=30)
+        if r.status_code != 200:
+            logger.error("Gemini pasaport okuma hatasi: %s %s", r.status_code, r.text[:500])
+            return None, False
+        result = r.json()
+        candidates = result.get("candidates", [])
+        if not candidates:
+            logger.error("Gemini bos yanit dondu: %s", result)
+            return None, False
+        text = candidates[0]["content"]["parts"][0]["text"]
+        data = json.loads(text)
+        fields = {
+            "isim": (data.get("isim") or "").strip(),
+            "soyisim": (data.get("soyisim") or "").strip(),
+            "pasaport_no": (data.get("pasaport_no") or "").strip().upper(),
+            "kimlik_no": (data.get("kimlik_no") or "").strip(),
+            "dogum_tarihi": (data.get("dogum_tarihi") or "").strip(),
+            "pasaport_skt": (data.get("pasaport_skt") or "").strip(),
+            "uyruk": (data.get("uyruk") or "").strip(),
+        }
+        # En az isim ya da pasaport numarasi okunamadiysa bu bilgiler
+        # guvenilir sayilmaz - manuel girise dusulsun.
+        if not fields["isim"] and not fields["pasaport_no"]:
+            return None, False
+        return fields, False
+    except Exception as e:
+        logger.error("Gemini pasaport okuma basarisiz: %s", e)
+        return None, False
+
+
 def ocr_space_extract_text(image_bytes):
     if not OCR_SPACE_API_KEY:
         return None
