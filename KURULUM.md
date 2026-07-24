@@ -121,6 +121,8 @@ Bu özellik, pasaport fotoğrafından bilgileri otomatik okuyup doğru ülke say
 
 **Kurulum (tek seferlik)**: adım adım talimatlar için `GOOGLE_SHEETS_KURULUM.md` dosyasına bakın. Özetle: bir Google Servis Hesabı oluşturup Sheets dosyanızı onunla paylaşacak, `GOOGLE_SERVICE_ACCOUNT_JSON` ve `SHEETS_SPREADSHEET_ID` değerlerini Render'a ekleyecek, her ülke sayfasına bir "ID" sütunu açacak ve [ocr.space](https://ocr.space/ocrapi/freekey) üzerinden ücretsiz bir `OCR_SPACE_API_KEY` alacaksınız. Yeni bir ülke sayfası eklediğinizde kodda hiçbir değişiklik gerekmez — bot sayfa listesini her seferinde canlı okur.
 
+**Yapay zeka ile yedek okuma (opsiyonel)**: MRZ satırları (OCR.space) okunamadığında bot artık otomatik olarak Google Gemini'ye (görsel anlama yapay zekası) başvurup pasaporttaki bilgileri okumayı dener — [aistudio.google.com](https://aistudio.google.com) üzerinden kredi kartı gerekmeden ücretsiz bir `GEMINI_API_KEY` alıp Render'a ekleyin. Bu yedekle okunan bilgilerde MRZ doğrulaması yapılamadığı için onay ekranında ayrı bir "🤖 yapay zeka ile okundu" uyarısı gösterilir — özellikle pasaport no, kimlik no ve son kullanma tarihini onaylamadan önce mutlaka kontrol edin. `GEMINI_API_KEY` boş bırakılırsa bu adım atlanır, sadece MRZ/OCR çalışır.
+
 **Renk şeması** (ülke sayfalarında):
 - **Renksiz**: sadece pasaport kaydı yapıldı, henüz hiçbir işlem yok.
 - **Sarı**: kayıt sıraya girdi / waitlist'te bekliyor (bazı VFS sitelerinde — örn. Hollanda, Bulgaristan — önce sıraya alınıyor, kesin randevu daha sonra veriliyor).
