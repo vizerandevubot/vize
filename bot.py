@@ -193,6 +193,9 @@ EMAIL_KEYWORDS = [
     if k.strip()
 ]
 MAIL_CHECK_INTERVAL_SECONDS = int(os.environ.get("MAIL_CHECK_INTERVAL_SECONDS", "15"))
+# Ayni anda kac IMAP hesabinin paralel taranacagi. Render'in ucretsiz plani
+# sadece 0.15 CPU verdigi icin varsayilan dusuk tutuldu (bkz. check_new_mail).
+IMAP_MAX_WORKERS = int(os.environ.get("IMAP_MAX_WORKERS", "2"))
 
 # ---------------------------------------------------------------------------
 # Kurulum
@@ -1725,11 +1728,15 @@ def check_new_mail():
     # hesaplarin toplami kadar degil.
     if not IMAP_ACCOUNTS:
         return
-    # Render'in ucretsiz plani kisitli bellek/CPU sunuyor - cok fazla
-    # ayni anda acik SSL baglantisi (15'e kadar) bellegi tasirip surecin
-    # OOM (bellek yetersizligi) nedeniyle cokmesine yol acabiliyordu. 4,
-    # hizi büyük olcude korurken kaynagi da makul tutan bir denge.
-    max_workers = min(len(IMAP_ACCOUNTS), 4)
+    # Render'in ucretsiz plani SADECE 0.15 CPU (bir cekirdegin %15'i) ve
+    # 512MB RAM veriyor - Render "Metrics" sayfasindan dogrulandi. Bu kadar
+    # kisitli bir CPU'da esalanli (paralel) is aslinda hizlandirmiyor, aksine
+    # ayni anda birden fazla SSL baglantisi + is parcaciginin CPU icin
+    # yarismasi tepe yuku artirip surecin "Instance failed" ile
+    # tekrar tekrar cokmesine/yeniden baslatilmasina yol aciyordu. Bu yuzden
+    # varsayilani 4'ten 2'ye dusuruyoruz; IMAP_MAX_WORKERS ortam degiskeniyle
+    # ayarlanabilir (1 = tamamen sirali, en az kaynak kullanir).
+    max_workers = min(len(IMAP_ACCOUNTS), IMAP_MAX_WORKERS)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
             executor.submit(
